@@ -19,9 +19,15 @@ their machine and are never committed.
 
 | Where | Private key location |
 | --- | --- |
-| The VM | `/etc/isws-vm/age.key`, `root:root`, mode `0600` |
+| The VM | `/data/secrets/age.key`, `root:root`, mode `0600` |
 | Linux laptop | `~/.config/sops/age/keys.txt` |
 | macOS laptop | `~/Library/Application Support/sops/age/keys.txt` |
+
+The VM's key sits on `/data`, a persistent volume, rather than under `/etc`.
+`/etc` is on the root filesystem, so rebuilding the machine would destroy the
+key and force a full re-key: new keypair, new entry in `.sops.yaml`,
+`stacks updatekeys` from a laptop, commit, push. On `/data` the VM keeps its
+identity as a recipient across a rebuild and none of that is needed.
 
 That macOS path is the single most common "works on the VM, not on my laptop"
 cause: sops resolves its default keyfile through Go's `os.UserConfigDir()`, which
