@@ -1,0 +1,10 @@
+[Unit]
+Description=Weekly check for container image updates
+
+[Timer]
+OnCalendar=Mon 07:00
+Persistent=true
+RandomizedDelaySec=1h
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,34 @@
+# --- Plaintext secrets: never commit ---------------------------------------
+secrets.env
+secrets.yaml
+secrets.*.env
+secrets.*.yaml
+*.dec
+*.dec.*
+
+# ...but the SOPS *ciphertext* is the whole point of this repo and must be
+# tracked. These negations have to come after the rules above: `secrets.*.env`
+# matches `secrets.enc.env` too, which would silently make every encrypted
+# secret un-committable.
+!secrets.enc.env
+!secrets.enc.yaml
+!secrets.enc.json
+!secrets.env.example
+
+# --- Intentionally tracked -------------------------------------------------
+# Pinned image tags live in stacks/*/.env and MUST be committed, so make sure
+# no broad .env rule ever shadows them.
+!stacks/*/.env
+
+# --- Keys: never, under any circumstances ----------------------------------
+*.agekey
+*.age.key
+age.key
+keys.txt
+
+# --- Runtime / local junk --------------------------------------------------
+acme.json
+*.bak
+*.new
+*.orig
+.DS_Store

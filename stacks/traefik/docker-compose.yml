@@ -1,0 +1,69 @@
+# Edge reverse proxy: owns :80 and :443, terminates TLS, and routes to any
+# container on the shared `edge` network that opts in with labels.
+#
+# Static configuration is expressed as CLI flags rather than a traefik.yml so
+# there is one less file to keep in sync with this one.
+
+services:
+  traefik:
+    image: traefik:${TRAEFIK_TAG}
+    container_name: traefik
+    restart: unless-stopped
+    command:
+      - --global.sendAnonymousUsage=false
+      - --log.level=${TRAEFIK_LOG_LEVEL}
+      - --accesslog=true
+
+      # Discover routes from container labels, but only where explicitly asked.
+      - --providers.docker=true
+      - --providers.docker.exposedByDefault=false
+      - --providers.docker.network=edge
+
+      - --entryPoints.web.address=:80
+      - --entryPoints.websecure.address=:443
+      # Everything on :80 is redirected; certs are issued over the TLS-ALPN
+      # challenge on :443, which needs no HTTP-01 exemption here.
+      - --entryPoints.web.http.redirections.entryPoint.to=websecure
+      - --entryPoints.web.http.redirections.entryPoint.scheme=https
+
+      - --certificatesResolvers.le.acme.email=${TRAEFIK_ACME_EMAIL}
+      - --certificatesResolvers.le.acme.caServer=${TRAEFIK_ACME_CASERVER}
+      - --certificatesResolvers.le.acme.storage=/acme/acme.json
+      - --certificatesResolvers.le.acme.tlsChallenge=true
+
+      - --api.dashboard=true
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      # Read-only socket access is still effectively root on the host; see
+      # docs/adding-a-stack.md for the socket-proxy hardening note.
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      # A named volume, not a bind mount: Traefik insists acme.json be 0600 and
+      # creates it correctly inside a volume, which sidesteps the permission
+      # fight a host bind mount always starts.
+      - acme:/acme
+    networks:
+      - edge
+    labels:
+      traefik.enable: "true"
+
+      # Dashboard, guarded by basic auth whose credential comes from SOPS.
+      traefik.http.routers.dashboard.rule: Host(`${TRAEFIK_DASHBOARD_HOST}`)
+      traefik.http.routers.dashboard.entryPoints: websecure
+      traefik.http.routers.dashboard.service: api@internal
+      traefik.http.routers.dashboard.tls.certResolver: le
+      traefik.http.routers.dashboard.middlewares: dashboard-auth
+
+      # TRAEFIK_DASHBOARD_AUTH is an htpasswd line, e.g. admin:$apr1$....
+      # The '$' characters need no doubling: the value arrives via interpolation
+      # and interpolated values are not re-interpolated. The $$ rule only
+      # applies to '$' typed literally into this file.
+      traefik.http.middlewares.dashboard-auth.basicauth.users: ${TRAEFIK_DASHBOARD_AUTH}
+
+volumes:
+  acme:
+
+networks:
+  edge:
+    external: true

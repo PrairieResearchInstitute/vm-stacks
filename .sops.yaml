@@ -1,0 +1,25 @@
+# SOPS configuration for the ISWS VM repo.
+#
+# This repo is PUBLIC. Anything matching the rules below is stored as
+# ciphertext; the plaintext only ever exists in the memory of a process holding
+# one of the age private keys listed here.
+#
+# Every key listed below can decrypt independently (they are OR, not AND), so
+# ADD recipients here -- never replace one. Removing the only key that can
+# currently decrypt a file locks you out of it.
+#
+# After changing this file, re-key the existing secrets:
+#   bin/stacks updatekeys
+#
+# See docs/secrets.md.
+
+creation_rules:
+  - path_regex: secrets\.enc\.(env|yaml|json)$
+    # Comma-separated list of age recipients.
+    age: >-
+      age1p0ucq5gllknvjdhnya06xjz8fl67nua5ddt7g5l88tcetv5e03ys3f25ex,
+      age1mfy42ur4u5kvvgxlfdlf69avtcslyn3zqwujzqg7zjkau9x0hdjsfr9mz8
+    #   ^ laptop: Ben Galewsky, ~/.config/sops/age/keys.txt
+    #                            (macOS default is ~/Library/Application Support/sops/age/keys.txt)
+    #   ^ second key added 2026-08-19 -- label this once you confirm whose it is
+    #     (the VM key belongs at /etc/isws-vm/age.key, root:root 0600)
