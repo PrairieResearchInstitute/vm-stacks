@@ -222,6 +222,9 @@ compose() {
 # every operator remember that, probe the usual spots and export
 # SOPS_AGE_KEY_FILE ourselves. An explicit SOPS_AGE_KEY_FILE always wins -- that
 # is what the systemd unit sets on the VM.
+#
+# The VM's key lives on the /data persistent volume, not under /etc, so a rebuild
+# of the machine does not destroy it. See docs/secrets.md.
 # ---------------------------------------------------------------------------
 
 find_age_key() {
@@ -233,7 +236,7 @@ find_age_key() {
   fi
   local c
   for c in \
-    /etc/isws-vm/age.key \
+    /data/secrets/age.key \
     "${XDG_CONFIG_HOME:-$HOME/.config}/sops/age/keys.txt" \
     "$HOME/Library/Application Support/sops/age/keys.txt"
   do

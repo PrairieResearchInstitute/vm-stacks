@@ -9,15 +9,18 @@ Documentation=https://github.com/BenGalewsky/isws-vm
 Requires=docker.service
 After=docker.service network-online.target
 Wants=network-online.target
+# The age key lives on the /data volume; do not start before it is mounted.
+RequiresMountsFor=/data/secrets
 
 [Service]
 Type=oneshot
 RemainAfterExit=yes
 WorkingDirectory=/opt/isws-vm
 
-# The age private key that decrypts stacks/*/secrets.enc.env.
-# Must be 0600 root:root. See docs/secrets.md.
-Environment=SOPS_AGE_KEY_FILE=/etc/isws-vm/age.key
+# The age private key that decrypts stacks/*/secrets.enc.env. On the persistent
+# /data volume so it survives a VM rebuild. Must be 0600 root:root.
+# See docs/secrets.md.
+Environment=SOPS_AGE_KEY_FILE=/data/secrets/age.key
 Environment=NO_COLOR=1
 
 ExecStart=/opt/isws-vm/bin/stacks up

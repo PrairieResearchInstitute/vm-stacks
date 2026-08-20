@@ -51,6 +51,10 @@ The age private key is missing or is not a recipient. In order of likelihood:
    not run after adding it.
 3. `SOPS_AGE_KEY_FILE` points somewhere that does not exist. `bin/stacks` warns
    about this specifically.
+4. On the VM, `/data` is not mounted, so `/data/secrets/age.key` is absent — the
+   warning from (3) is the symptom. Check with `findmnt /data`. The boot unit
+   carries `RequiresMountsFor=/data/secrets` so systemd waits for the volume,
+   but a hand-run `stacks up` on a VM whose volume failed to mount will hit this.
 
 ## `stacks bump` reports a truncation error
 
@@ -133,7 +137,7 @@ on your interactive shell (a PATH addition from `.zshrc`, an unexported variable
 
 ```sh
 env -i PATH=/usr/local/bin:/usr/bin:/bin HOME=/root \
-    SOPS_AGE_KEY_FILE=/etc/isws-vm/age.key \
+    SOPS_AGE_KEY_FILE=/data/secrets/age.key \
     /opt/isws-vm/bin/stacks up
 ```
 

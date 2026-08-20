@@ -18,8 +18,8 @@ creation_rules:
     # Comma-separated list of age recipients.
     age: >-
       age1p0ucq5gllknvjdhnya06xjz8fl67nua5ddt7g5l88tcetv5e03ys3f25ex,
-      age1mfy42ur4u5kvvgxlfdlf69avtcslyn3zqwujzqg7zjkau9x0hdjsfr9mz8
+      age1hl0ct3w4c8962f4hgef6s6wyfwuf3n8283739dw9y24we87p3eksjk3eyw
     #   ^ laptop: Ben Galewsky, ~/.config/sops/age/keys.txt
     #                            (macOS default is ~/Library/Application Support/sops/age/keys.txt)
-    #   ^ second key added 2026-08-19 -- label this once you confirm whose it is
-    #     (the VM key belongs at /etc/isws-vm/age.key, root:root 0600)
+    #   ^ second key added 2026-08-20 -- ISWS Virtual Machine
+    #     (the VM key belongs at /data/secrets/age.key, root:root 0600)

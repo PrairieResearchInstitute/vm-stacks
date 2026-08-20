@@ -65,13 +65,24 @@ chmod 755 /opt/isws-vm
 
 ## 4. Give the VM an age key
 
-Generate a keypair **on the VM** so the private half never travels:
+**Rebuilding an existing VM?** Check first:
 
 ```sh
-install -d -m 0700 /etc/isws-vm
-age-keygen -o /etc/isws-vm/age.key
-chmod 600 /etc/isws-vm/age.key
-grep 'public key' /etc/isws-vm/age.key
+ls -l /data/secrets/age.key
+```
+
+`/data` is a persistent volume, which is exactly why the key lives there. If
+that file is already present the VM is still a recipient — skip the rest of this
+section entirely and go to step 5. Do **not** regenerate; a new keypair would
+mean re-keying every secrets file for nothing.
+
+Otherwise, generate a keypair **on the VM** so the private half never travels:
+
+```sh
+install -d -m 0700 /data/secrets
+age-keygen -o /data/secrets/age.key
+chmod 600 /data/secrets/age.key
+grep 'public key' /data/secrets/age.key
 ```
 
 Take that public key, add it to `.sops.yaml` from your laptop, re-key the
