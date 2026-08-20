@@ -1,0 +1,408 @@
+#!/usr/bin/env bash
+#
+# stacks -- manage the docker-compose stacks that provision the ISWS VM.
+#
+# Run `stacks help` for usage. See README.md and docs/ for the full story.
+
+set -euo pipefail
+
+REPO_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
+# shellcheck source=../lib/common.sh
+. "$REPO_ROOT/lib/common.sh"
+
+# Aggregate failure tracking: a broken stack must not stop the rest of the VM
+# from coming up at boot, so multi-stack runs collect failures and report at the
+# end instead of aborting on the first one.
+FAILED=()
+
+run_stack() {
+  local label=$1 name=$2; shift 2
+  if compose "$name" "$@"; then
+    return 0
+  fi
+  err "$label failed for stack '$name'"
+  FAILED+=("$name")
+  return 1
+}
+
+# Called once by main(), never by the cmd_* helpers -- they have to be able to
+# return so that composite commands (restart, bump --deploy) can chain them.
+finish() {
+  if (( ${#FAILED[@]} )); then
+    err "failed stack(s): ${FAILED[*]}"
+    exit 2
+  fi
+  exit 0
+}
+
+# ---------------------------------------------------------------------------
+# up / down / restart / pull
+# ---------------------------------------------------------------------------
+
+cmd_up() {
+  require_docker
+  local names
+  read_stack_list names "$@"
+  (( ${#names[@]} )) || { warn "no stacks to bring up"; return 0; }
+
+  local n
+  for n in "${names[@]}"; do
+    stack_meta "$n"
+    log "up: $n${SM_DESCRIPTION:+ ($SM_DESCRIPTION)}"
+    [[ -n $SM_NETWORKS ]] && ensure_networks "$SM_NETWORKS"
+
+    local up_args=(up --detach --remove-orphans)
+    # WAIT=1 holds the bring-up until the stack is healthy. Used for the edge
+    # proxy so later stacks register against a live Traefik.
+    [[ $SM_WAIT == 1 ]] && up_args+=(--wait --wait-timeout 180)
+
+    run_stack up "$n" "${up_args[@]}" || true
+  done
+
+  # ENABLED=0 only stops a stack from being *started*. A stack disabled while it
+  # was running would otherwise stay up indefinitely and no `up` would ever
+  # mention it, so say so out loud. Tearing it down automatically is deliberately
+  # not done: `up` should never stop a service the operator did not name.
+  (( $# )) && return 0
+  local d
+  while IFS= read -r d; do
+    [[ -n $d ]] || continue
+    stack_meta "$d"
+    [[ $SM_ENABLED == 0 ]] || continue
+    if [[ -n $(compose "$d" ps -q 2>/dev/null) ]]; then
+      warn "stack '$d' is ENABLED=0 but still has containers running"
+      warn "  stop it with: $0 down $d"
+    fi
+  done < <(all_stack_names)
+}
+
+cmd_down() {
+  require_docker
+  local names
+  read_stack_list names "$@"
+  (( ${#names[@]} )) || return 0
+
+  # Reverse order: dependents go away before the proxy they hang off.
+  local i n
+  for (( i=${#names[@]}-1; i>=0; i-- )); do
+    n=${names[i]}
+    log "down: $n"
+    run_stack down "$n" down || true
+  done
+}
+
+cmd_restart() {
+  (( $# )) || die "restart requires at least one stack name (use 'down' then 'up' for everything)"
+  cmd_down "$@"
+  # A down failure is reported but does not stop the bring-up: the usual cause is
+  # a stack that was not running in the first place.
+  FAILED=()
+  cmd_up "$@"
+}
+
+cmd_pull() {
+  require_docker
+  local names n
+  read_stack_list names "$@"
+  for n in "${names[@]}"; do
+    log "pull: $n"
+    run_stack pull "$n" pull || true
+  done
+}
+
+# ---------------------------------------------------------------------------
+# Inspection
+# ---------------------------------------------------------------------------
+
+cmd_ps() {
+  require_docker
+  local names n
+  read_stack_list names "$@"
+  for n in "${names[@]}"; do
+    log "$n"
+    compose "$n" ps || true
+  done
+}
+
+cmd_logs() {
+  require_docker
+  (( $# )) || die "logs requires a stack name: stacks logs <stack> [-f] [service...]"
+  local name=$1; shift
+  compose "$name" logs "$@"
+}
+
+cmd_config() {
+  require_docker
+  (( $# )) || die "config requires a stack name"
+  warn "'config' renders the fully resolved compose file, INCLUDING decrypted secrets"
+  compose "$1" config
+}
+
+cmd_status() {
+  require_docker
+  printf '%s%-16s %5s %8s %-9s %s%s\n' "$C_BOLD" STACK ORDER ENABLED RUNNING DESCRIPTION "$C_RESET"
+  local n running total
+  while IFS= read -r n; do
+    [[ -n $n ]] || continue
+    stack_meta "$n"
+    running=$(compose "$n" ps --status running -q 2>/dev/null | grep -c . || true)
+    total=$(compose "$n" ps -a -q 2>/dev/null | grep -c . || true)
+    printf '%-16s %5s %8s %-9s %s\n' \
+      "$n" "$SM_ORDER" \
+      "$([[ $SM_ENABLED == 1 ]] && echo yes || echo no)" \
+      "$running/$total" "$SM_DESCRIPTION"
+  done < <(all_stack_names | sort)
+
+  echo
+  printf '%s%-16s %-26s %s%s\n' "$C_BOLD" STACK VARIABLE "PINNED TAG" "$C_RESET"
+  local var image pattern
+  while IFS= read -r n; do
+    [[ -n $n ]] || continue
+    stack_meta "$n"
+    while read -r var image pattern; do
+      [[ -n ${var:-} ]] || continue
+      printf '%-16s %-26s %s\n' "$n" "$var" "$(env_get "$n" "$var")"
+    done <<<"$SM_IMAGES"
+  done < <(all_stack_names | sort)
+}
+
+# ---------------------------------------------------------------------------
+# Tag bumping
+# ---------------------------------------------------------------------------
+
+# env_get <stack> <var> -- current value from the stack's committed .env
+env_get() {
+  local f="$STACKS_DIR/$1/.env"
+  [[ -f $f ]] || return 0
+  sed -n "s/^$2=//p" "$f" | tail -n1
+}
+
+# env_set <stack> <var> <value> -- rewrite in place, preserving comments and
+# ordering. Deliberately not `sed -i`: BSD sed requires an argument to -i, so a
+# temp file plus mv is the portable form and is also atomic.
+env_set() {
+  local f="$STACKS_DIR/$1/.env" var=$2 val=$3 tmp
+  tmp=$(mktemp "$f.XXXXXX")
+  awk -v k="$var" -v v="$val" '
+    $0 ~ "^" k "=" && !done { print k "=" v; done=1; next }
+    { print }
+    END { if (!done) print k "=" v }
+  ' "$f" >"$tmp"
+  mv "$tmp" "$f"
+}
+
+cmd_bump() {
+  require_cmd curl jq
+  # shellcheck source=../lib/registry.sh
+  . "$REPO_ROOT/lib/registry.sh"
+
+  local apply=0 deploy=0 names=()
+  while (( $# )); do
+    case $1 in
+      --apply)  apply=1 ;;
+      --deploy) deploy=1; apply=1 ;;
+      --dry-run) apply=0 ;;
+      -*) die "unknown bump option: $1" ;;
+      *)  names+=("$1") ;;
+    esac
+    shift
+  done
+
+  local ordered checked=0 available=0 changed_stacks=()
+  read_stack_list ordered "${names[@]+"${names[@]}"}"
+
+  local n var image pattern cur new
+  for n in "${ordered[@]}"; do
+    stack_meta "$n"
+    [[ -n ${SM_IMAGES//[[:space:]]/} ]] || continue
+
+    local stack_changed=0
+    while read -r var image pattern; do
+      [[ -n ${var:-} ]] || continue
+      [[ -n ${image:-} && -n ${pattern:-} ]] \
+        || { warn "$n: malformed IMAGES entry for '$var' (want: VAR image regex)"; continue; }
+
+      checked=$(( checked + 1 ))
+      cur=$(env_get "$n" "$var")
+
+      # newest_tag prints its own diagnostic and never returns a guess, so a
+      # failure here is recorded as a real failure: "we could not check" must not
+      # be reportable as "nothing to update".
+      if ! new=$(newest_tag "$image" "$pattern") || [[ -z $new ]]; then
+        printf '%-14s %-22s %s\n' "$n" "$var" "${C_YELLOW}check FAILED (see error above)${C_RESET}"
+        FAILED+=("$n")
+        continue
+      fi
+
+      if [[ $new == "$cur" ]]; then
+        printf '%-14s %-22s %s%s = up to date%s\n' "$n" "$var" "$C_DIM" "$cur" "$C_RESET"
+        continue
+      fi
+
+      available=$(( available + 1 ))
+      printf '%-14s %-22s %s -> %s%s%s\n' "$n" "$var" "${cur:-<unset>}" "$C_GREEN$C_BOLD" "$new" "$C_RESET"
+      if (( apply )); then
+        env_set "$n" "$var" "$new"
+        stack_changed=1
+      fi
+    done <<<"$SM_IMAGES"
+
+    (( stack_changed )) && changed_stacks+=("$n")
+  done
+
+  echo
+  if (( apply )); then
+    if (( available )); then
+      ok "$checked image(s) checked, $available updated in stacks/*/.env"
+      info "review with: git diff -- stacks"
+    else
+      info "$checked image(s) checked, everything already up to date"
+    fi
+  else
+    info "$checked image(s) checked, $available update(s) available (dry run)"
+    (( available )) && info "apply with: $0 bump${names[*]+ ${names[*]}} --apply"
+  fi
+
+  if (( deploy )) && (( ${#changed_stacks[@]} )); then
+    log "deploying: ${changed_stacks[*]}"
+    cmd_pull "${changed_stacks[@]}"
+    cmd_up "${changed_stacks[@]}"
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# Secrets
+# ---------------------------------------------------------------------------
+
+cmd_edit_secrets() {
+  require_cmd sops
+  (( $# )) || die "edit-secrets requires a stack name"
+  local name=$1 f="$STACKS_DIR/$1/secrets.enc.env"
+  [[ -d "$STACKS_DIR/$name" ]] || die "no such stack: $name"
+  if [[ ! -f $f ]]; then
+    log "creating $f"
+    info "an editor will open on an empty file; add KEY=value lines and save"
+  fi
+  sops edit "$f"
+}
+
+# Re-encrypt every secrets file against the current .sops.yaml recipient list.
+# Wrapped rather than left to bare `sops updatekeys` because this needs the same
+# age-key discovery as everything else -- on macOS sops looks under
+# ~/Library/Application Support, so a key in ~/.config is invisible to it and the
+# re-key fails with a confusing "no key could decrypt" error.
+cmd_updatekeys() {
+  require_cmd sops
+  local files=() f
+  for f in "$STACKS_DIR"/*/secrets.enc.*; do
+    [[ -f $f ]] && files+=("$f")
+  done
+  (( ${#files[@]} )) || { info "no encrypted secrets files found"; return 0; }
+
+  info "using SOPS_AGE_KEY_FILE=${SOPS_AGE_KEY_FILE:-<unset, relying on sops defaults>}"
+  local rc=0
+  for f in "${files[@]}"; do
+    log "updatekeys: ${f#"$REPO_ROOT"/}"
+    # A re-key has to decrypt first, so this only works while at least one
+    # CURRENT recipient's private key is available on this machine.
+    sops updatekeys -y "$f" || { err "failed to re-key $f"; rc=1; }
+  done
+  (( rc == 0 )) && ok "all secrets re-keyed; commit the result"
+  return "$rc"
+}
+
+# ---------------------------------------------------------------------------
+# systemd installation
+# ---------------------------------------------------------------------------
+
+cmd_install() {
+  local unit=isws-stacks.service
+  local src="$REPO_ROOT/systemd/$unit" dest="/etc/systemd/system/$unit"
+  [[ -f $src ]] || die "missing $src"
+  [[ $(id -u) == 0 ]] || die "install must run as root: sudo $0 install"
+  command -v systemctl >/dev/null 2>&1 || die "systemctl not found; this command is for the Linux VM"
+
+  if [[ $REPO_ROOT != /opt/isws-vm ]]; then
+    warn "repo is at $REPO_ROOT but the unit hardcodes /opt/isws-vm"
+    warn "either clone to /opt/isws-vm or edit systemd/$unit before installing"
+  fi
+
+  log "installing $dest"
+  install -m 0644 "$src" "$dest"
+  systemctl daemon-reload
+  systemctl enable "$unit"
+  ok "enabled. start now with: systemctl start $unit"
+  info "logs: journalctl -u $unit -f"
+}
+
+# ---------------------------------------------------------------------------
+# Help
+# ---------------------------------------------------------------------------
+
+cmd_help() {
+  cat <<'EOF'
+stacks -- manage the ISWS VM docker-compose stacks
+
+USAGE
+  stacks <command> [stack...] [options]
+
+  With no stack names, commands act on every enabled stack in ORDER (see
+  stack.conf). Naming a stack explicitly overrides ENABLED=0.
+
+COMMANDS
+  up [stack...]           Create/update stacks (detached, idempotent). Boot path.
+  down [stack...]         Stop and remove stacks, in reverse ORDER.
+  restart <stack>...      down then up, for the named stacks.
+  pull [stack...]         Pull images for the pinned tags.
+  ps [stack...]           Container listing per stack.
+  status                  Overview: order, enabled, running counts, pinned tags.
+  logs <stack> [-f] [svc] Tail logs for a stack.
+  config <stack>          Render the resolved compose file. PRINTS SECRETS.
+  bump [stack...]         Check registries for newer tags. Dry run by default.
+    --apply                 write the new tags into stacks/*/.env
+    --deploy                implies --apply, then pull + up the changed stacks
+  edit-secrets <stack>    Open the stack's SOPS-encrypted secrets in $EDITOR.
+  updatekeys              Re-encrypt all secrets against .sops.yaml's recipients.
+                          Run after adding or removing an age key.
+  install                 Install and enable the systemd unit (root, on the VM).
+  help                    This text.
+
+EXIT CODES
+  0 success   1 usage/config error   2 one or more stacks failed
+
+EXAMPLES
+  stacks up                       # everything, as systemd does at boot
+  stacks status
+  stacks bump                     # what new releases are out there?
+  stacks bump traefik --apply     # pin the new tag, then commit the .env diff
+  stacks logs traefik -f
+EOF
+}
+
+# ---------------------------------------------------------------------------
+
+main() {
+  local cmd=${1:-help}
+  (( $# )) && shift
+  # The stack-mutating commands funnel through finish() so a partial failure
+  # surfaces as exit 2 after every stack has had its turn. The read-only
+  # commands pass their own exit status straight through.
+  case $cmd in
+    up)            cmd_up "$@"; finish ;;
+    down)          cmd_down "$@"; finish ;;
+    restart)       cmd_restart "$@"; finish ;;
+    pull)          cmd_pull "$@"; finish ;;
+    bump)          cmd_bump "$@"; finish ;;
+    ps)            cmd_ps "$@" ;;
+    status)        cmd_status "$@" ;;
+    logs)          cmd_logs "$@" ;;
+    config)        cmd_config "$@" ;;
+    edit-secrets)  cmd_edit_secrets "$@" ;;
+    updatekeys)    cmd_updatekeys "$@" ;;
+    install)       cmd_install "$@" ;;
+    help|-h|--help) cmd_help ;;
+    *)             err "unknown command: $cmd"; echo; cmd_help; exit 1 ;;
+  esac
+}
+
+main "$@"

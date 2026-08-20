@@ -1,0 +1,8 @@
+# Follow `. "$REPO_ROOT/lib/..."` sources relative to the script's directory.
+external-sources=true
+source-path=SCRIPTDIR/..
+source-path=SCRIPTDIR
+
+# Cross-file variables: lib/common.sh sets SM_*/C_* for bin/stacks to consume,
+# so shellcheck cannot see the use site from the definition site.
+disable=SC2034

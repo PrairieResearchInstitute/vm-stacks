@@ -1,0 +1,32 @@
+# Template application stack. It reaches the outside world through the shared
+# `edge` network and the Traefik labels below -- no host ports to allocate, no
+# TLS to configure here.
+
+services:
+  app:
+    image: nginx:${EXAMPLE_TAG}
+    restart: unless-stopped
+    environment:
+      # Bare name, no '=': passes the ambient value through. `stacks` puts the
+      # decrypted SOPS secrets in the environment, so this is how they reach the
+      # container.
+      - EXAMPLE_API_TOKEN
+    networks:
+      - edge
+      - internal
+    labels:
+      traefik.enable: "true"
+      traefik.docker.network: edge
+      traefik.http.routers.example.rule: Host(`${EXAMPLE_HOST}`)
+      traefik.http.routers.example.entryPoints: websecure
+      traefik.http.routers.example.tls.certResolver: le
+      # Container-side port. Required whenever the image exposes more than one.
+      traefik.http.services.example.loadbalancer.server.port: "80"
+
+networks:
+  # Created by `stacks up` from NETWORKS= in stack.conf.
+  edge:
+    external: true
+  # Private to this stack: anything that should not be reachable from the proxy
+  # (a database, a worker) goes here and stays off `edge`.
+  internal:
