@@ -26,6 +26,9 @@ secrets.*.yaml
 age.key
 keys.txt
 
+# htpasswd files - convienient to generate them locally
+htpasswd
+
 # --- Runtime / local junk --------------------------------------------------
 acme.json
 *.bak
