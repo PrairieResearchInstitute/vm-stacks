@@ -38,13 +38,10 @@ creation_rules:
       age1hl0ct3w4c8962f4hgef6s6wyfwuf3n8283739dw9y24we87p3eksjk3eyw
 
   # --- isgs ----------------------------------------------------------------
-  # Laptop only until the VM is bootstrapped. Generate its keypair ON the VM,
-  # add the public half here, then `bin/stacks updatekeys`. Until that is done
-  # the machine cannot decrypt anything and `stacks up` fails with a decryption
-  # error -- expected, not a bug. See docs/bootstrap.md.
   - path_regex: stacks/isgs/.*secrets\.enc\.(env|yaml|json)$
     age: >-
-      age1p0ucq5gllknvjdhnya06xjz8fl67nua5ddt7g5l88tcetv5e03ys3f25ex
+      age1p0ucq5gllknvjdhnya06xjz8fl67nua5ddt7g5l88tcetv5e03ys3f25ex,
+      age1l5d8te04c3qqxdjtpj8l8xcdyngs02ne7t5ucywhkjujqcnwc93s86ajxz
 
   # --- odsc ----------------------------------------------------------------
   # Laptop only until the VM is bootstrapped -- see the isgs note above.
