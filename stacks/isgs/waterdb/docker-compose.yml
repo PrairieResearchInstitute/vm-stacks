@@ -1,0 +1,175 @@
+# ISGS water data application: a single Node container (SvelteKit, listening on
+# 3000) published through the shared Traefik proxy. No host port is bound and no
+# TLS is configured here -- both belong to the traefik stack.
+#
+# Its bulk data lives in S3, reached with the credentials in secrets.enc.env;
+# its relational data lives in the shared postgres cluster, reached over the
+# `db` network.
+#
+# Three containers, in one ordered chain -- the two jobs exit, the application
+# stays up:
+#
+#   waterdb-provision   reconciles this stack's role and database in the shared
+#                       cluster, over its Unix socket
+#           |  service_completed_successfully
+#   seed                loads the staged data under ${WATERDB_DATA_DIR} into
+#                       that database, over TCP as the application's own role
+#           |  service_completed_successfully
+#   waterdb             the application
+#
+# Nothing here can depend_on the postgres stack's service: that is a separate
+# Compose project, and depends_on only resolves names within one. The head of
+# the chain waits for the cluster itself -- see provision-db.sh.
+
+services:
+  waterdb:
+    image: ghcr.io/prairieresearchinstitute/isgs_waterdb:${WATERDB_TAG}
+    container_name: waterdb
+    restart: unless-stopped
+
+    environment:
+      - S3_BUCKET=${WATERDB_S3_BUCKET}
+      # Host `postgres`, reachable because of the `db` network below. The role,
+      # the database and the password are all what waterdb-provision reconciled.
+      - DATABASE_URL=postgresql://${WATERDB_DB_USER}:${WATERDB_DB_PASSWORD:?WATERDB_DB_PASSWORD missing from secrets.enc.env}@postgres:5432/${WATERDB_DB_NAME}
+      # From secrets.enc.env. The ${VAR:?...} form documents which secrets this
+      # stack needs and turns a missing one into a clear startup error instead
+      # of an application that comes up and cannot read its data.
+      #
+      # These land in the container environment, so they are readable via
+      # `docker inspect` to anyone in the `docker` group -- root-equivalent on
+      # this host anyway. See docs/secrets.md.
+      - S3_ENDPOINT=${S3_ENDPOINT:?S3_ENDPOINT missing from secrets.enc.env}
+      - S3_ACCESS_KEY=${S3_ACCESS_KEY:?S3_ACCESS_KEY missing from secrets.enc.env}
+      - S3_SECRET_KEY=${S3_SECRET_KEY:?S3_SECRET_KEY missing from secrets.enc.env}
+
+    networks:
+      - edge
+      - db
+
+    # Not started until the data it serves is in the database. A failed seed
+    # therefore leaves this container not started at all, rather than up and
+    # serving an empty or half-loaded database.
+    depends_on:
+      seed:
+        condition: service_completed_successfully
+
+    labels:
+      traefik.enable: "true"
+      # Required, not optional: this container is on both `edge` and `db`, and
+      # without this label Traefik has two addresses to choose between and may
+      # route to the one it cannot reach.
+      traefik.docker.network: edge
+      # Router and service names must be unique across every container on this
+      # VM -- Traefik reads all of their labels at once -- hence the stack name.
+      traefik.http.routers.waterdb.rule: Host(`${WATERDB_HOST}`)
+      traefik.http.routers.waterdb.entryPoints: websecure
+      traefik.http.routers.waterdb.tls.certResolver: le
+      # Container-side port: the image sets PORT=3000 and exposes it.
+      traefik.http.services.waterdb.loadbalancer.server.port: "3000"
+
+  # One-shot provisioning job: creates -- or reconciles -- this stack's role and
+  # database in the shared postgres cluster, then exits. See provision-db.sh.
+  #
+  # It authenticates over the cluster's Unix socket, where pg_hba.conf says
+  # `local all all trust`, so it needs no admin password and none has to be
+  # copied into this stack's secrets. Mounting that socket directory is
+  # equivalent to being a superuser on the cluster; see the postgres stack's
+  # README.md.
+  #
+  # It leaves an `Exited (0)` container behind on purpose: that is the record it
+  # ran, and `docker logs waterdb-provision` says what it did. `stacks status`
+  # therefore reports this stack as 1/3 running rather than 3/3, which is
+  # correct and not a fault.
+  waterdb-provision:
+    # The same image the postgres stack runs, so the host holds one copy of it.
+    image: postgres:${POSTGRES_TAG}
+    container_name: waterdb-provision
+
+    # Not `unless-stopped`: this is a job. A failure has to stay visible as
+    # Exited (1) rather than thrash, and a success must not be restarted.
+    restart: "no"
+
+    # It talks to the database over a filesystem socket and to nothing else, so
+    # it needs no network at all -- which also stops Compose creating a default
+    # one for this project just to hold it.
+    network_mode: none
+
+    # Replaces the image's entrypoint outright: this container must not try to
+    # be a server. Invoked via `bash <path>` so the mounted file's mode does not
+    # matter.
+    entrypoint: ["bash", "/provision-db.sh"]
+
+    environment:
+      - POSTGRES_ADMIN_USER=${POSTGRES_ADMIN_USER}
+      - WATERDB_DB_NAME=${WATERDB_DB_NAME}
+      - WATERDB_DB_USER=${WATERDB_DB_USER}
+      # From secrets.enc.env, same as the application above. Changing it changes
+      # this service's configuration, so `up` recreates the container and the job
+      # re-runs -- which is how a rotated password reaches the role. `up`, not
+      # `restart`; see docs/secrets.md.
+      - WATERDB_DB_PASSWORD=${WATERDB_DB_PASSWORD:?WATERDB_DB_PASSWORD missing from secrets.enc.env}
+
+    volumes:
+      # Relative to this file's directory, which is where `stacks` runs compose
+      # from.
+      - ./provision-db.sh:/provision-db.sh:ro
+      # Where the postgres stack publishes its socket. Read-only: connecting to
+      # a socket does not write to the directory it sits in, and this job has no
+      # business creating anything in the host's /run.
+      #
+      # Must match POSTGRES_SOCKET_DIR in the postgres stack's .env.
+      - ${POSTGRES_SOCKET_DIR}:/var/run/postgresql:ro
+
+    # No `user:`: running as root is what keeps the socket reachable whatever
+    # mode the postgres entrypoint leaves its directory in.
+
+  # One-shot seeding job: loads the staged data under ${WATERDB_DATA_DIR} into
+  # this stack's database, then exits.
+  #
+  # It is idempotent, and it re-runs on every `stacks up waterdb` -- which is
+  # what holds the application back until the data it serves is actually in the
+  # database. `up` therefore takes as long as a seed does, with no timeout on
+  # the wait: WAIT=0 in stack.conf means no `--wait-timeout` is in play.
+  #
+  # Unlike waterdb-provision, this one connects over TCP as the application's
+  # own role, so it needs the `db` network and the password from
+  # secrets.enc.env. It gets no socket mount: seeding is not a superuser job.
+  #
+  # Its image shares WATERDB_TAG with the application -- see stack.conf.
+  seed:
+    image: ghcr.io/prairieresearchinstitute/isgs_waterdb-seed:${WATERDB_TAG}
+    container_name: waterdb-seed
+
+    # A job, not a service, exactly as above.
+    restart: "no"
+
+    environment:
+      # Identical to the application's, and for the same reason: this is the
+      # credential waterdb-provision has just reconciled onto the role.
+      - DATABASE_URL=postgresql://${WATERDB_DB_USER}:${WATERDB_DB_PASSWORD:?WATERDB_DB_PASSWORD missing from secrets.enc.env}@postgres:5432/${WATERDB_DB_NAME}
+
+    volumes:
+      # Operator-staged input: the files have to be on the host before `up`.
+      - ${WATERDB_DATA_DIR}:/data
+
+    networks:
+      - db
+
+    # NOT `postgres`: that service belongs to the postgres stack, a separate
+    # Compose project, and depends_on cannot cross one. Waiting on the
+    # provisioning job is stronger anyway -- it holds the bounded wait for the
+    # cluster to accept connections AND creates the role and database this job
+    # then writes as.
+    depends_on:
+      waterdb-provision:
+        condition: service_completed_successfully
+
+networks:
+  # Both created by `stacks up` from NETWORKS= in stack.conf.
+  edge:
+    external: true
+  # The postgres stack's private network. Nothing on it is reachable from
+  # Traefik; see that stack's docker-compose.yml.
+  db:
+    external: true

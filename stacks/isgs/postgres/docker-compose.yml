@@ -47,6 +47,17 @@ services:
       # preparing by hand.
       - ${POSTGRES_DATA_DIR}:/var/lib/postgresql
 
+      # Published so that provisioning jobs in application stacks can connect
+      # over the socket and authenticate with `trust`, instead of every one of
+      # them needing a copy of POSTGRES_ADMIN_PASSWORD. See README.md -- mounting
+      # this directory anywhere is equivalent to handing out superuser.
+      #
+      # Read-write: the server creates the socket here and unlinks it on a clean
+      # shutdown. The image's entrypoint chowns and chmods the directory to the
+      # postgres uid on every start, so an empty host directory created by the
+      # daemon needs nothing prepared by hand.
+      - ${POSTGRES_SOCKET_DIR}:/var/run/postgresql
+
     networks:
       - db
 
