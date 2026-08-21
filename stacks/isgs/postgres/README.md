@@ -96,10 +96,50 @@ A file works the same way:
 docker exec -i postgres psql -U pgadmin -d postgres -v ON_ERROR_STOP=1 < migration.sql
 ```
 
+## Publishing the socket
+
+`POSTGRES_SOCKET_DIR` in [`.env`](.env) — `/run/postgresql` — is bind-mounted to
+`/var/run/postgresql`, so the server's Unix socket appears on the host rather than
+only inside the container. It is on `/run` and not `/data` deliberately: a socket
+is runtime state, `/run` is tmpfs, and a stale socket that outlived its cluster
+would give clients `ECONNREFUSED` instead of a clear “no such file”.
+
+The point of publishing it is authentication. The first line of `pg_hba.conf` is
+`local all all trust`, so **any container that mounts that directory is a
+superuser on this cluster** — no password involved. That is what lets an
+application stack provision its own role and database without a copy of
+`POSTGRES_ADMIN_PASSWORD`, and it is also why the mount is not something to hand
+out casually. It is defensible here only because membership of the `docker` group
+is already root-equivalent on this host; see [docs/secrets.md](../../../docs/secrets.md).
+
+Stacks that mount it today:
+
+| Stack | What it mounts it for |
+| --- | --- |
+| [`waterdb`](../waterdb/) | `waterdb-provision`, read-only — reconciles its own role and database |
+
+Check it from the host:
+
+```sh
+ls -l /run/postgresql          # .s.PGSQL.5432, owned by uid 999
+```
+
 ## Provisioning a database for an application
 
 The admin role is a superuser and applications should not use it. Give each one
-its own role and database:
+its own role and database.
+
+**Prefer a provisioning job in the application's own stack.**
+[`waterdb`](../waterdb/) is the worked example: a one-shot container that mounts
+the socket directory above, reconciles its role and database on every
+`stacks up`, and reads its password from its own stack's `secrets.enc.env`. That
+keeps the app's credential in the app's stack, survives a rebuild of this VM
+without anyone remembering to re-run anything, and makes rotating the password an
+`edit-secrets` plus an `up` rather than hand-written SQL. Copy
+`waterdb/provision-db.sh` and the `waterdb-provision` service from its
+`docker-compose.yml`.
+
+For a one-off, or to see what that job is doing, the manual equivalent is:
 
 ```sh
 docker exec -i postgres psql -U pgadmin -d postgres -v ON_ERROR_STOP=1 <<'SQL'
@@ -108,8 +148,14 @@ create database myapp owner myapp;
 SQL
 ```
 
-Put that password in the *application* stack's `secrets.enc.env`, not this one —
-it is the app's credential. Then the app connects over the `db` network:
+Note this is create-once: run it twice and the second run fails on the existing
+role, and it has no way to bring an already-created role's password back into
+line with a rotated secret. The provisioning job exists precisely to close both
+gaps.
+
+Either way, that password belongs in the *application* stack's
+`secrets.enc.env`, not this one — it is the app's credential. An app that talks
+to the database over the network then connects over `db`:
 
 ```
 postgresql://myapp:<password>@postgres:5432/myapp
