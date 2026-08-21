@@ -1,8 +1,11 @@
 #!/usr/bin/env bash
 #
-# stacks -- manage the docker-compose stacks that provision the ISWS VM.
+# stacks -- manage the docker-compose stacks that provision the Prairie Research
+# Institute VMs.
 #
-# Run `stacks help` for usage. See README.md and docs/ for the full story.
+# One repo, several machines: stacks/<vm>/<stack>/. Every command acts on exactly
+# one VM -- normally the one it is running on, worked out from the hostname. Run
+# `stacks help` for usage. See README.md and docs/ for the full story.
 
 set -euo pipefail
 
@@ -40,6 +43,7 @@ finish() {
 # ---------------------------------------------------------------------------
 
 cmd_up() {
+  require_vm
   require_docker
   local names
   read_stack_list names "$@"
@@ -77,6 +81,7 @@ cmd_up() {
 }
 
 cmd_down() {
+  require_vm
   require_docker
   local names
   read_stack_list names "$@"
@@ -101,9 +106,13 @@ cmd_restart() {
 }
 
 cmd_pull() {
+  require_vm
   require_docker
   local names n
   read_stack_list names "$@"
+  # A VM with no stacks yet is a normal state, and "${empty[@]}" is an unbound
+  # variable under `set -u` on bash 3.2. Same guard as cmd_down.
+  (( ${#names[@]} )) || return 0
   for n in "${names[@]}"; do
     log "pull: $n"
     run_stack pull "$n" pull || true
@@ -115,9 +124,11 @@ cmd_pull() {
 # ---------------------------------------------------------------------------
 
 cmd_ps() {
+  require_vm
   require_docker
   local names n
   read_stack_list names "$@"
+  (( ${#names[@]} )) || return 0
   for n in "${names[@]}"; do
     log "$n"
     compose "$n" ps || true
@@ -125,6 +136,7 @@ cmd_ps() {
 }
 
 cmd_logs() {
+  require_vm
   require_docker
   (( $# )) || die "logs requires a stack name: stacks logs <stack> [-f] [service...]"
   local name=$1; shift
@@ -132,13 +144,46 @@ cmd_logs() {
 }
 
 cmd_config() {
+  require_vm
   require_docker
   (( $# )) || die "config requires a stack name"
   warn "'config' renders the fully resolved compose file, INCLUDING decrypted secrets"
   compose "$1" config
 }
 
+# The discoverability command: from a laptop, where hostname detection never
+# matches, this is how you find out what the VM names are. Deliberately does not
+# require_vm -- it has to work in exactly the case where resolution fails.
+cmd_vms() {
+  local current
+  # `|| current=''` OUTSIDE the substitution: resolve_vm dies via `exit`, which
+  # terminates the subshell before any `|| true` inside it could run, so an
+  # inner fallback would let set -e kill the very command meant to survive this.
+  current=$(resolve_vm 2>/dev/null) || current=''
+
+  printf '%s%-2s%-10s %6s  %-42s %s%s\n' \
+    "$C_BOLD" '' VM STACKS DESCRIPTION HOSTNAMES "$C_RESET"
+  local v count
+  while IFS= read -r v; do
+    [[ -n $v ]] || continue
+    vm_meta "$v"
+    count=$(all_stack_names "$VMS_DIR/$v" | grep -c . || true)
+    printf '%-2s%-10s %6s  %-42s %s\n' \
+      "$([[ $v == "$current" ]] && echo '*' || echo '')" \
+      "$v" "$count" "$VM_DESCRIPTION" "$VM_HOSTNAMES"
+  done < <(all_vm_names)
+
+  echo
+  if [[ -n $current ]]; then
+    info "* = the VM commands act on here; override with --vm <name> or STACKS_VM"
+  else
+    warn "no VM matches this machine's hostname"
+    info "name one explicitly: --vm <name>, or STACKS_VM=<name>"
+  fi
+}
+
 cmd_status() {
+  require_vm
   require_docker
   printf '%s%-16s %5s %8s %-9s %s%s\n' "$C_BOLD" STACK ORDER ENABLED RUNNING DESCRIPTION "$C_RESET"
   local n running total
@@ -192,6 +237,7 @@ env_set() {
 }
 
 cmd_bump() {
+  require_vm
   require_cmd curl jq
   # shellcheck source=../lib/registry.sh
   . "$REPO_ROOT/lib/registry.sh"
@@ -212,7 +258,9 @@ cmd_bump() {
   read_stack_list ordered "${names[@]+"${names[@]}"}"
 
   local n var image pattern cur new
-  for n in "${ordered[@]}"; do
+  # Guarded rather than returned early, so a VM with no stacks still gets the
+  # "0 image(s) checked" summary below instead of silence.
+  for n in ${ordered[@]+"${ordered[@]}"}; do
     stack_meta "$n"
     [[ -n ${SM_IMAGES//[[:space:]]/} ]] || continue
 
@@ -254,7 +302,7 @@ cmd_bump() {
   if (( apply )); then
     if (( available )); then
       ok "$checked image(s) checked, $available updated in stacks/*/.env"
-      info "review with: git diff -- stacks"
+      info "review with: git diff -- stacks/$SELECTED_VM"
     else
       info "$checked image(s) checked, everything already up to date"
     fi
@@ -275,6 +323,7 @@ cmd_bump() {
 # ---------------------------------------------------------------------------
 
 cmd_edit_secrets() {
+  require_vm
   require_cmd sops
   (( $# )) || die "edit-secrets requires a stack name"
   local name=$1 f="$STACKS_DIR/$1/secrets.enc.env"
@@ -291,10 +340,16 @@ cmd_edit_secrets() {
 # age-key discovery as everything else -- on macOS sops looks under
 # ~/Library/Application Support, so a key in ~/.config is invisible to it and the
 # re-key fails with a confusing "no key could decrypt" error.
+#
+# The only command that deliberately ignores the VM selection and walks EVERY
+# VM. .sops.yaml is shared, so a change to it affects all of them, and re-keying
+# half the repo is how you end up with a file no key on any machine can read.
+# Files whose creation rule you cannot decrypt (another VM's secrets, once the
+# per-VM rules are in place) simply fail and are reported.
 cmd_updatekeys() {
   require_cmd sops
   local files=() f
-  for f in "$STACKS_DIR"/*/secrets.enc.*; do
+  for f in "$VMS_DIR"/*/*/secrets.enc.*; do
     [[ -f $f ]] && files+=("$f")
   done
   (( ${#files[@]} )) || { info "no encrypted secrets files found"; return 0; }
@@ -316,23 +371,28 @@ cmd_updatekeys() {
 # ---------------------------------------------------------------------------
 
 cmd_install() {
-  local unit=isws-stacks.service
+  # First, so a vm.conf whose HOSTNAMES do not match this machine is caught now
+  # rather than at the next boot, when the unit would fail to work out its VM.
+  require_vm
+
+  local unit=vm-stacks.service
   local src="$REPO_ROOT/systemd/$unit" dest="/etc/systemd/system/$unit"
   [[ -f $src ]] || die "missing $src"
   [[ $(id -u) == 0 ]] || die "install must run as root: sudo $0 install"
   command -v systemctl >/dev/null 2>&1 || die "systemctl not found; this command is for the Linux VM"
 
-  if [[ $REPO_ROOT != /opt/isws-vm ]]; then
-    warn "repo is at $REPO_ROOT but the unit hardcodes /opt/isws-vm"
-    warn "either clone to /opt/isws-vm or edit systemd/$unit before installing"
+  if [[ $REPO_ROOT != /opt/vm-stacks ]]; then
+    warn "repo is at $REPO_ROOT but the unit hardcodes /opt/vm-stacks"
+    warn "either clone to /opt/vm-stacks or edit systemd/$unit before installing"
   fi
 
   log "installing $dest"
   install -m 0644 "$src" "$dest"
   systemctl daemon-reload
   systemctl enable "$unit"
-  ok "enabled. start now with: systemctl start $unit"
-  info "logs: journalctl -u $unit -f"
+  ok "enabled for vm '$SELECTED_VM'. start now with: systemctl start vm-stacks"
+  info "logs: journalctl -u vm-stacks -f"
+  info "the unit carries no VM name: it detects '$SELECTED_VM' from the hostname"
 }
 
 # ---------------------------------------------------------------------------
@@ -341,15 +401,26 @@ cmd_install() {
 
 cmd_help() {
   cat <<'EOF'
-stacks -- manage the ISWS VM docker-compose stacks
+stacks -- manage the Prairie Research Institute VMs' docker-compose stacks
 
 USAGE
-  stacks <command> [stack...] [options]
+  stacks [--vm <name>] <command> [stack...] [options]
 
-  With no stack names, commands act on every enabled stack in ORDER (see
-  stack.conf). Naming a stack explicitly overrides ENABLED=0.
+  Stacks live in stacks/<vm>/<stack>/. Every command acts on exactly one VM:
+
+    1. --vm <name>, anywhere in the arguments
+    2. $STACKS_VM
+    3. the machine's own hostname, matched against stacks/*/vm.conf HOSTNAMES
+
+  On a VM, (3) means no flag is ever needed. Off it -- your laptop -- name the
+  VM. `stacks vms` lists them. Nothing is guessed: if none of the three
+  resolves, the command fails rather than act on the wrong machine's config.
+
+  With no stack names, commands act on every enabled stack of that VM in ORDER
+  (see stack.conf). Naming a stack explicitly overrides ENABLED=0.
 
 COMMANDS
+  vms                     List the VMs, and which one resolves here.
   up [stack...]           Create/update stacks (detached, idempotent). Boot path.
   down [stack...]         Stop and remove stacks, in reverse ORDER.
   restart <stack>...      down then up, for the named stacks.
@@ -359,29 +430,50 @@ COMMANDS
   logs <stack> [-f] [svc] Tail logs for a stack.
   config <stack>          Render the resolved compose file. PRINTS SECRETS.
   bump [stack...]         Check registries for newer tags. Dry run by default.
-    --apply                 write the new tags into stacks/*/.env
+    --apply                 write the new tags into stacks/<vm>/*/.env
     --deploy                implies --apply, then pull + up the changed stacks
   edit-secrets <stack>    Open the stack's SOPS-encrypted secrets in $EDITOR.
-  updatekeys              Re-encrypt all secrets against .sops.yaml's recipients.
-                          Run after adding or removing an age key.
+  updatekeys              Re-encrypt EVERY VM's secrets against .sops.yaml's
+                          recipients. Run after adding or removing an age key.
   install                 Install and enable the systemd unit (root, on the VM).
   help                    This text.
+
+OPTIONS
+  --vm <name>, --vm=<name>   Which VM to act on. Accepted anywhere in the
+                             arguments; equivalent to STACKS_VM=<name>.
 
 EXIT CODES
   0 success   1 usage/config error   2 one or more stacks failed
 
 EXAMPLES
-  stacks up                       # everything, as systemd does at boot
-  stacks status
-  stacks bump                     # what new releases are out there?
-  stacks bump traefik --apply     # pin the new tag, then commit the .env diff
+  stacks up                            # on a VM: everything, as systemd does
+  stacks vms                           # which VMs exist, which one is this?
+  stacks --vm isws status              # from a laptop
+  stacks --vm isws bump                # what new releases are out there?
+  stacks --vm isws bump traefik --apply
   stacks logs traefik -f
+  STACKS_VM=isws stacks config traefik
 EOF
 }
 
 # ---------------------------------------------------------------------------
 
 main() {
+  # --vm is pulled out of the argument list wherever it appears, before the
+  # command is dispatched, so both `stacks --vm isws bump --apply` and
+  # `stacks bump --vm isws --apply` work. No subcommand has a --vm flag of its
+  # own, so there is nothing for this to shadow.
+  local args=()
+  while (( $# )); do
+    case $1 in
+      --vm)   shift; (( $# )) || die "--vm requires a VM name"; VM_OVERRIDE=$1 ;;
+      --vm=*) VM_OVERRIDE=${1#--vm=} ;;
+      *)      args+=("$1") ;;
+    esac
+    shift
+  done
+  set -- ${args[@]+"${args[@]}"}
+
   local cmd=${1:-help}
   (( $# )) && shift
   # The stack-mutating commands funnel through finish() so a partial failure
@@ -393,6 +485,7 @@ main() {
     restart)       cmd_restart "$@"; finish ;;
     pull)          cmd_pull "$@"; finish ;;
     bump)          cmd_bump "$@"; finish ;;
+    vms)           cmd_vms "$@" ;;
     ps)            cmd_ps "$@" ;;
     status)        cmd_status "$@" ;;
     logs)          cmd_logs "$@" ;;

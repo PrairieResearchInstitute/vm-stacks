@@ -2,7 +2,18 @@
 #
 # Shared helpers for bin/stacks. Sourced, never executed directly.
 
-STACKS_DIR="$REPO_ROOT/stacks"
+# stacks/ holds one directory per VM; each of those holds the stacks for that
+# machine. STACKS_DIR is deliberately NOT set here -- it only becomes meaningful
+# once a VM has been resolved, and require_vm sets it. Everything below that
+# takes a stack name reads $STACKS_DIR, so scoping it to a VM is the only change
+# the multi-VM layout needs.
+VMS_DIR="$REPO_ROOT/stacks"
+
+# Set by require_vm / the --vm pre-pass in bin/stacks. Initialised here so an
+# unrelated variable of the same name in the caller's environment cannot decide
+# which machine's configuration we act on.
+SELECTED_VM=''
+VM_OVERRIDE=''
 
 # ---------------------------------------------------------------------------
 # Output
@@ -45,6 +56,135 @@ require_docker() {
 }
 
 # ---------------------------------------------------------------------------
+# VM discovery and selection
+#
+# stacks/<vm>/ holds one machine's stacks plus a vm.conf naming it. The CLI
+# always operates on exactly one VM. Which one comes from, in order:
+#
+#   1. --vm <name>     explicit, wins over everything
+#   2. $STACKS_VM      for a shell or a unit that wants it fixed
+#   3. the machine's own hostname, matched against vm.conf's HOSTNAMES
+#
+# (3) is what lets systemd/vm-stacks.service be installed byte-identical on
+# every machine. When nothing matches, the CLI refuses to guess: acting on
+# another VM's config would be far worse than failing.
+# ---------------------------------------------------------------------------
+
+# lower <string> -- bash 3.2 has no ${var,,}, and macOS ships 3.2.
+lower() { printf '%s' "$1" | tr '[:upper:]' '[:lower:]'; }
+
+# all_vm_names: every directory under stacks/ holding a vm.conf, excluding names
+# that start with '_' -- stacks/_template sits at this level.
+all_vm_names() {
+  local d name
+  for d in "$VMS_DIR"/*/; do
+    [[ -d $d ]] || continue
+    name=$(basename "$d")
+    [[ $name == _* ]] && continue
+    [[ -f "$d/vm.conf" ]] || continue
+    printf '%s\n' "$name"
+  done
+}
+
+vm_names_oneline() { all_vm_names | tr '\n' ' ' | sed 's/ *$//'; }
+
+# vm_meta <name> -> sets globals: VM_DESCRIPTION VM_HOSTNAMES
+#
+# Sourced in a subshell and echoed back, exactly as stack_meta does and for the
+# same reason: a malformed conf must not be able to clobber the CLI's own state.
+vm_meta() {
+  local name=$1 dir="$VMS_DIR/$1" raw
+  [[ -d $dir ]] || die "no such vm: $name (known: $(vm_names_oneline))"
+
+  raw=$(
+    set +eu
+    DESCRIPTION='' HOSTNAMES=''
+    if [[ -f "$dir/vm.conf" ]]; then
+      # shellcheck disable=SC1091
+      . "$dir/vm.conf" >/dev/null 2>&1
+    fi
+    printf '%s\t%s\n' "$DESCRIPTION" "$HOSTNAMES"
+  ) || die "failed to read $dir/vm.conf"
+
+  IFS=$'\t' read -r VM_DESCRIPTION VM_HOSTNAMES <<<"$raw"
+}
+
+# hostname_candidates: what this machine calls itself, lowercased, one per line.
+#
+# Each probe is guarded: `hostname -f` needs a working resolver and exits
+# non-zero on a minimal image or a VM whose DNS is still settling, and that must
+# not be fatal -- the short name usually matches anyway.
+hostname_candidates() {
+  local h
+  for h in "$(hostname -s 2>/dev/null || true)" \
+           "$(hostname    2>/dev/null || true)" \
+           "$(hostname -f 2>/dev/null || true)"; do
+    [[ -z $h ]] && continue
+    lower "$h"
+    printf '\n'
+  done
+  return 0
+}
+
+# vm_matches_host <vm> -- true if this machine answers to one of that VM's names.
+# The directory name always counts as an alias, so a minimal vm.conf still works.
+vm_matches_host() {
+  local vm=$1 alias c
+  vm_meta "$vm"
+  # Unquoted on purpose: HOSTNAMES is a space-separated list.
+  # shellcheck disable=SC2086
+  for alias in "$vm" $VM_HOSTNAMES; do
+    alias=$(lower "$alias")
+    while IFS= read -r c; do
+      [[ -n $c ]] || continue
+      [[ $c == "$alias" ]] && return 0
+    done < <(hostname_candidates)
+  done
+  return 1
+}
+
+# resolve_vm -- print the selected VM name on stdout, or die.
+resolve_vm() {
+  local vms
+  vms=$(all_vm_names)
+  [[ -n $vms ]] || die "no VM directories under $VMS_DIR -- each one needs a vm.conf"
+
+  local want=${VM_OVERRIDE:-${STACKS_VM:-}}
+  if [[ -n $want ]]; then
+    grep -qxF -- "$want" <<<"$vms" \
+      || die "no such vm: $want
+  known VMs: $(vm_names_oneline)"
+    printf '%s\n' "$want"
+    return 0
+  fi
+
+  local vm
+  while IFS= read -r vm; do
+    [[ -n $vm ]] || continue
+    if vm_matches_host "$vm"; then
+      printf '%s\n' "$vm"
+      return 0
+    fi
+  done <<<"$vms"
+
+  die "cannot tell which VM this is -- hostname '$(hostname 2>/dev/null || echo '?')' matches no vm.conf HOSTNAMES
+  known VMs: $(vm_names_oneline)
+  pick one:  --vm <name>   or   STACKS_VM=<name>
+  on the VM itself, add its \`hostname -f\` to stacks/<name>/vm.conf instead"
+}
+
+# require_vm -- resolve the VM once and scope STACKS_DIR to it. Idempotent, so
+# composite commands (restart, bump --deploy) can call it freely; only the first
+# call does any work or announces anything.
+require_vm() {
+  [[ -n $SELECTED_VM ]] && return 0
+  SELECTED_VM=$(resolve_vm) || exit 1
+  STACKS_DIR="$VMS_DIR/$SELECTED_VM"
+  vm_meta "$SELECTED_VM"
+  log "vm: $SELECTED_VM${VM_DESCRIPTION:+ -- $VM_DESCRIPTION}"
+}
+
+# ---------------------------------------------------------------------------
 # Stack discovery and metadata
 #
 # Every stack directory holds a stack.conf of shell key=value assignments. It is
@@ -53,11 +193,14 @@ require_docker() {
 # own variables nor abort it.
 # ---------------------------------------------------------------------------
 
-# all_stack_names: every directory under stacks/ holding a docker-compose.yml,
-# excluding names that start with '_' (e.g. _template).
+# all_stack_names [vm-dir]: every directory under the selected VM's stacks/<vm>/
+# holding a docker-compose.yml, excluding names that start with '_'.
+#
+# The optional argument lets `stacks vms` count another VM's stacks without
+# reassigning STACKS_DIR out from under the caller.
 all_stack_names() {
-  local d name
-  for d in "$STACKS_DIR"/*/; do
+  local base=${1:-$STACKS_DIR} d name
+  for d in "$base"/*/; do
     [[ -d $d ]] || continue
     name=$(basename "$d")
     [[ $name == _* ]] && continue

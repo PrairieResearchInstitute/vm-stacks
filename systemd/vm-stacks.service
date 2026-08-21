@@ -1,0 +1,42 @@
+# Brings every enabled stack up at boot, and tears them down on shutdown.
+#
+# This file is byte-identical on every PRI VM: it carries no VM name, because
+# `bin/stacks` works out which machine it is on from the hostname, matched
+# against the HOSTNAMES in each stacks/<vm>/vm.conf. If a machine's hostname is
+# not listed there, the boot fails with "cannot tell which VM this is" -- fix
+# the vm.conf rather than adding Environment=STACKS_VM= here, so a rename of the
+# host is one commit instead of a change on the box.
+#
+# Install with:  sudo /opt/vm-stacks/bin/stacks install
+# Logs with:     journalctl -u vm-stacks -f
+
+[Unit]
+Description=Prairie Research Institute VM docker-compose stacks
+Documentation=https://github.com/PrairieResearchInstitute/vm-stacks
+Requires=docker.service
+After=docker.service network-online.target
+Wants=network-online.target
+# The age key lives on the /data volume; do not start before it is mounted.
+RequiresMountsFor=/data/secrets
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+WorkingDirectory=/opt/vm-stacks
+
+# The age private key that decrypts this VM's stacks/<vm>/*/secrets.enc.env. It
+# only needs to be a recipient of its own VM's rule in .sops.yaml. On the persistent
+# /data volume so it survives a VM rebuild. Must be 0600 root:root.
+# See docs/secrets.md.
+Environment=SOPS_AGE_KEY_FILE=/data/secrets/age.key
+Environment=NO_COLOR=1
+
+ExecStart=/opt/vm-stacks/bin/stacks up
+ExecStop=/opt/vm-stacks/bin/stacks down
+
+# A cold first boot pulls every image before anything reports ready.
+TimeoutStartSec=900
+TimeoutStopSec=300
+
+[Install]
+WantedBy=multi-user.target

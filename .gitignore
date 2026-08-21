@@ -16,9 +16,13 @@ secrets.*.yaml
 !secrets.env.example
 
 # --- Intentionally tracked -------------------------------------------------
-# Pinned image tags live in stacks/*/.env and MUST be committed, so make sure
-# no broad .env rule ever shadows them.
-!stacks/*/.env
+# Pinned image tags live in stacks/<vm>/<stack>/.env and MUST be committed, so
+# make sure no broad .env rule ever shadows them. The depth matters: this repo
+# holds one directory per VM, so the pattern needs two wildcards.
+#   git check-ignore -v stacks/isws/traefik/.env   # must report nothing
+!stacks/*/*/.env
+# ...and the shared template, which sits one level shallower.
+!stacks/_template/.env
 
 # --- Keys: never, under any circumstances ----------------------------------
 *.agekey

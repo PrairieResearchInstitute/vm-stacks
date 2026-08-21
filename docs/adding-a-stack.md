@@ -1,13 +1,20 @@
 # Adding a stack
 
+A stack belongs to exactly one VM: it lives at `stacks/<vm>/<name>/`. Two VMs
+that run the same service each get their own directory — they have different
+hostnames, different secrets, and upgrade on their own schedule.
+
+Examples below use `isws`; substitute the VM you are working on. From the VM
+itself the `--vm` flag is unnecessary.
+
 ## 1. Copy the template
 
 ```sh
-cp -r stacks/_template stacks/myapp
+cp -r stacks/_template stacks/isws/myapp
 ```
 
-`stacks/_template` is skipped by the CLI (leading underscore), so it can live
-alongside real stacks indefinitely.
+`stacks/_template` sits at the VM level and is shared by every VM. It is skipped
+by VM discovery (leading underscore), so it can live there indefinitely.
 
 ## 2. Fill in `stack.conf`
 
@@ -39,7 +46,7 @@ makes `up` block on healthchecks.
 
 ```ini
 MYAPP_TAG=v1.4.2
-MYAPP_HOST=myapp.isws.illinois.edu
+MYAPP_HOST=myapp.isws.prairie.illinois.edu
 ```
 
 Committed, and public. No secrets here — see [secrets.md](secrets.md).
@@ -83,9 +90,11 @@ volumes:
 
 Points worth copying:
 
-- **Router and service names must be unique across the whole VM.** Traefik reads
-  labels from every container at once, so `routers.app` in two stacks collide.
-  Name them after the stack.
+- **Router and service names must be unique within the VM.** Traefik reads labels
+  from every container on the machine at once, so `routers.app` in two stacks on
+  the same VM collide. Name them after the stack. Across VMs there is no
+  constraint — each has its own Traefik — so two VMs may both have
+  `routers.myapp`.
 - **`traefik.docker.network: edge`** tells Traefik which network to reach the
   container on. Required whenever a container is on more than one network.
 - **`loadbalancer.server.port`** is the container-side port. Required whenever
@@ -98,18 +107,22 @@ Points worth copying:
 ## 5. Add secrets, if any
 
 ```sh
-stacks edit-secrets myapp
+stacks --vm isws edit-secrets myapp
 ```
+
+The path decides the recipients: `.sops.yaml` has one rule per VM, so a secret
+under `stacks/isws/` is encrypted to your laptop and the isws machine, and to
+nothing else. Nothing to configure per stack.
 
 Delete `secrets.env.example` once the real encrypted file exists.
 
 ## 6. Validate, deploy, commit
 
 ```sh
-stacks config myapp            # renders the compose file; catches missing vars
-stacks up myapp
-stacks logs myapp -f
-git add stacks/myapp && git commit -m 'add myapp stack'
+stacks --vm isws config myapp  # renders the compose file; catches missing vars
+stacks --vm isws up myapp
+stacks --vm isws logs myapp -f
+git add stacks/isws/myapp && git commit -m 'isws: add myapp stack'
 ```
 
 `stacks config` warns that it prints decrypted secrets — do not redirect it to a
@@ -117,9 +130,9 @@ file.
 
 ## Parking a stack
 
-Set `ENABLED=0` in `stack.conf` and it is skipped by `up`, `pull`, and `bump`.
-Naming it explicitly (`stacks up myapp`) still works, which is the intended
-escape hatch.
+Set `ENABLED=0` in `stack.conf` and it is skipped by `up`, `pull`, and `bump` on
+that VM. Naming it explicitly (`stacks up myapp`) still works, which is the
+intended escape hatch.
 
 Disabling does not stop a running stack — `stacks up` warns if a disabled stack
 still has containers, but will not tear it down, because `up` should never stop a
@@ -128,6 +141,22 @@ service you did not name. Stop it yourself:
 ```sh
 stacks down myapp
 ```
+
+## Moving a stack to another VM
+
+`git mv stacks/isws/myapp stacks/odsc/myapp`, then, because the destination has a
+different recipient list, re-key the secrets and change the hostnames:
+
+```sh
+stacks updatekeys                     # re-encrypts to odsc's rule
+$EDITOR stacks/odsc/myapp/.env        # MYAPP_HOST, and anything else host-shaped
+stacks --vm isws down myapp           # on the old machine
+stacks --vm odsc up myapp             # on the new one
+```
+
+`updatekeys` can only re-key while a *current* recipient's private key is on the
+machine you run it from — your laptop is a recipient of every rule, which is why
+this works from there and not from either VM.
 
 ## Note on the Docker socket
 

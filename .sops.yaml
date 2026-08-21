@@ -1,25 +1,60 @@
-# SOPS configuration for the ISWS VM repo.
+# SOPS configuration for the Prairie Research Institute VM repo.
+#
+# ONE file for every VM, on purpose: the recipient lists are the kind of thing
+# that goes wrong when it is scattered, and `bin/stacks updatekeys` re-keys the
+# whole repo in one pass against these rules.
 #
 # This repo is PUBLIC. Anything matching the rules below is stored as
 # ciphertext; the plaintext only ever exists in the memory of a process holding
 # one of the age private keys listed here.
 #
-# Every key listed below can decrypt independently (they are OR, not AND), so
-# ADD recipients here -- never replace one. Removing the only key that can
-# currently decrypt a file locks you out of it.
+# Within a rule, every key can decrypt independently (they are OR, not AND), so
+# ADD recipients -- never replace one. Removing the only key that can currently
+# decrypt a file locks you out of it.
 #
-# After changing this file, re-key the existing secrets:
+# Rules are matched in order and the FIRST match wins, so the per-VM rules must
+# stay above the catch-all at the bottom. Scoping by path is what keeps one VM's
+# key from reading another VM's secrets: a compromise of isws does not hand over
+# isgs and odsc.
+#
+# Adding a VM means adding a rule here. Adding a machine or a person to an
+# existing VM means adding their public key to that VM's rule, then:
 #   bin/stacks updatekeys
 #
 # See docs/secrets.md.
 
+# Laptop: Ben Galewsky, ~/.config/sops/age/keys.txt
+#   (macOS default is ~/Library/Application Support/sops/age/keys.txt)
+#     age1p0ucq5gllknvjdhnya06xjz8fl67nua5ddt7g5l88tcetv5e03ys3f25ex
+#
+# ISWS VM, /data/secrets/age.key -- added 2026-08-20
+#     age1hl0ct3w4c8962f4hgef6s6wyfwuf3n8283739dw9y24we87p3eksjk3eyw
+
 creation_rules:
-  - path_regex: secrets\.enc\.(env|yaml|json)$
-    # Comma-separated list of age recipients.
+  # --- isws ----------------------------------------------------------------
+  - path_regex: stacks/isws/.*secrets\.enc\.(env|yaml|json)$
     age: >-
       age1p0ucq5gllknvjdhnya06xjz8fl67nua5ddt7g5l88tcetv5e03ys3f25ex,
       age1hl0ct3w4c8962f4hgef6s6wyfwuf3n8283739dw9y24we87p3eksjk3eyw
-    #   ^ laptop: Ben Galewsky, ~/.config/sops/age/keys.txt
-    #                            (macOS default is ~/Library/Application Support/sops/age/keys.txt)
-    #   ^ second key added 2026-08-20 -- ISWS Virtual Machine
-    #     (the VM key belongs at /data/secrets/age.key, root:root 0600)
+
+  # --- isgs ----------------------------------------------------------------
+  # Laptop only until the VM is bootstrapped. Generate its keypair ON the VM,
+  # add the public half here, then `bin/stacks updatekeys`. Until that is done
+  # the machine cannot decrypt anything and `stacks up` fails with a decryption
+  # error -- expected, not a bug. See docs/bootstrap.md.
+  - path_regex: stacks/isgs/.*secrets\.enc\.(env|yaml|json)$
+    age: >-
+      age1p0ucq5gllknvjdhnya06xjz8fl67nua5ddt7g5l88tcetv5e03ys3f25ex
+
+  # --- odsc ----------------------------------------------------------------
+  # Laptop only until the VM is bootstrapped -- see the isgs note above.
+  - path_regex: stacks/odsc/.*secrets\.enc\.(env|yaml|json)$
+    age: >-
+      age1p0ucq5gllknvjdhnya06xjz8fl67nua5ddt7g5l88tcetv5e03ys3f25ex
+
+  # --- catch-all -----------------------------------------------------------
+  # Anything encrypted outside a VM directory. No VM key belongs here: a secret
+  # that is not scoped to a machine has no business being readable by one.
+  - path_regex: secrets\.enc\.(env|yaml|json)$
+    age: >-
+      age1p0ucq5gllknvjdhnya06xjz8fl67nua5ddt7g5l88tcetv5e03ys3f25ex

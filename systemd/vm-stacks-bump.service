@@ -1,0 +1,20 @@
+# Weekly report of available image updates. Deliberately a DRY RUN: on a machine
+# serving real users, deciding to take a new release is a human's call. The
+# output lands in the journal.
+#
+#   journalctl -u vm-stacks-bump --since '1 week ago'
+#
+# Install with:
+#   sudo cp systemd/vm-stacks-bump.* /etc/systemd/system/
+#   sudo systemctl daemon-reload && sudo systemctl enable --now vm-stacks-bump.timer
+
+[Unit]
+Description=Report available container image updates for this VM's stacks
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/opt/vm-stacks
+Environment=NO_COLOR=1
+ExecStart=/opt/vm-stacks/bin/stacks bump
