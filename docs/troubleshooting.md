@@ -2,6 +2,66 @@
 
 Symptoms, in the form you will actually see them.
 
+## `cannot tell which VM this is`
+
+```
+error: cannot tell which VM this is -- hostname 'foo' matches no vm.conf HOSTNAMES
+  known VMs: isgs isws odsc
+```
+
+Working as intended, and it means one of two things.
+
+**On your laptop**: expected. Nothing there is a PRI VM. Name the VM:
+
+```sh
+stacks vms                     # what the names are
+stacks --vm isws status
+STACKS_VM=isws stacks status   # equivalent
+```
+
+**On a VM**: its hostname is not listed in `stacks/<vm>/vm.conf`. Compare:
+
+```sh
+hostname -s; hostname; hostname -f
+grep HOSTNAMES /opt/vm-stacks/stacks/*/vm.conf
+```
+
+Fix it in the repo — add the name to that VM's `HOSTNAMES`, push, `git pull` —
+rather than setting `STACKS_VM` on the box or adding it to the unit. The whole
+point of hostname detection is that `vm-stacks.service` is identical everywhere,
+so a host rename stays one reviewable commit.
+
+A directory under `stacks/` with no `vm.conf` is not a VM at all and will not
+appear in `stacks vms`.
+
+**On a VM, also check the sparse checkout.** VMs are cloned with a sparse
+checkout that includes only that machine's `stacks/<vm>/`, so a wrong name there
+leaves no VM directory on disk at all and `stacks` reports `no VM directories
+under .../stacks`. Confirm with `git sparse-checkout list` and `ls stacks`; see
+[bootstrap.md §3](bootstrap.md#3-clone-the-repo-sparse).
+
+## `stacks up` acted on the wrong VM's stacks
+
+It cannot, unless you told it to. Check what it announced: every command that
+touches stacks prints the VM first.
+
+```
+==> vm: isws -- Illinois State Water Survey VM
+```
+
+If that is wrong, something is setting `STACKS_VM` in your environment
+(`echo $STACKS_VM`) or two VMs list the same name in `HOSTNAMES` — the first
+match in alphabetical order wins, so make the lists disjoint.
+
+## `Failed to get the data key` for one VM but not another
+
+Expected. `.sops.yaml` has one rule per VM and each machine's key is a recipient
+of its own VM's secrets only, so on `isws` you can read `stacks/isws/...` and
+nothing else. See [secrets.md](secrets.md).
+
+If you hit this on a **laptop**, that is different — your key should be a
+recipient of every rule, so see the entry below.
+
 ## `network edge declared as external, but could not be found`
 
 `edge` is `external: true` in every stack, so compose will not create it.
@@ -11,6 +71,14 @@ in a stack directory. Either use `stacks up`, or:
 ```sh
 docker network create edge
 ```
+
+## A new stack's secrets cannot be read on the VM
+
+You encrypted the file with `--filename-override secrets.enc.env` — the bare
+basename. The creation rules match on **path**, so that hit the catch-all rule,
+which contains your laptop key and no VM key. Give the full repo-relative path
+instead, or just use `stacks edit-secrets <stack>`, which passes the real path.
+See [secrets.md](secrets.md).
 
 ## `stacks config` shows `$$apr1$$…` in a password hash
 
@@ -47,14 +115,16 @@ The age private key is missing or is not a recipient. In order of likelihood:
    ```
 
    This is the usual cause of a failed `sops updatekeys` on a fresh laptop.
-2. The VM's public key was never added to `.sops.yaml`, or `sops updatekeys` was
-   not run after adding it.
+2. The VM's public key was never added to **its own rule** in `.sops.yaml`, or
+   `stacks updatekeys` was not run after adding it. Adding it to another VM's
+   rule, or to the catch-all, does not help the machine that needs it.
 3. `SOPS_AGE_KEY_FILE` points somewhere that does not exist. `bin/stacks` warns
    about this specifically.
 4. On the VM, `/data` is not mounted, so `/data/secrets/age.key` is absent — the
    warning from (3) is the symptom. Check with `findmnt /data`. The boot unit
    carries `RequiresMountsFor=/data/secrets` so systemd waits for the volume,
    but a hand-run `stacks up` on a VM whose volume failed to mount will hit this.
+5. You are reading another VM's secrets. That is by design — see the entry above.
 
 ## `stacks bump` reports a truncation error
 
@@ -86,7 +156,8 @@ as `/bin/bash`. The scripts are written to work on 3.2; if you see this, a chang
 introduced a bash-4-only builtin. Test with:
 
 ```sh
-/bin/bash ./bin/stacks status
+/bin/bash ./bin/stacks vms
+/bin/bash ./bin/stacks --vm isws status
 ```
 
 ## `'docker compose' (Compose v2+) is not available`
@@ -138,12 +209,16 @@ on your interactive shell (a PATH addition from `.zshrc`, an unexported variable
 ```sh
 env -i PATH=/usr/local/bin:/usr/bin:/bin HOME=/root \
     SOPS_AGE_KEY_FILE=/data/secrets/age.key \
-    /opt/isws-vm/bin/stacks up
+    /opt/vm-stacks/bin/stacks up
 ```
+
+Note that `env -i` keeps `hostname` on `PATH`, so VM detection is exercised too —
+which is worth knowing, because it is the one thing the boot path needs that an
+interactive run gets for free.
 
 And the real thing:
 
 ```sh
-systemctl restart isws-stacks
-journalctl -u isws-stacks -b --no-pager
+systemctl restart vm-stacks
+journalctl -u vm-stacks -b --no-pager
 ```

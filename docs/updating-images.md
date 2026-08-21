@@ -4,21 +4,39 @@ Every image is pinned to an exact tag in its stack's `.env`. `stacks bump` finds
 newer tags and rewrites those files; it never pulls, restarts, or deploys.
 Deploying stays a separate, deliberate step.
 
+`bump` is scoped to one VM, like every other command: it only looks at
+`stacks/<vm>/*/.env`. Each machine upgrades on its own schedule, and a bump
+commit touches one VM's files.
+
 ## The workflow
 
+Run on the VM, where the VM is detected from the hostname:
+
 ```sh
-git -C /opt/isws-vm pull --ff-only
+git -C /opt/vm-stacks pull --ff-only
 stacks bump                      # read-only report
 stacks bump --apply              # rewrite the .env files
 git diff                         # review: one line per bumped tag
 stacks pull                      # fetch the new images
 stacks up                        # converge, traefik first
 stacks status                    # verify
-git commit -am 'bump traefik to v3.7.11' && git push
+git commit -am 'isws: bump traefik to v3.7.11' && git push
 ```
 
+From a laptop, the check is read-only and worth doing across the fleet:
+
+```sh
+for vm in isws isgs odsc; do stacks --vm "$vm" bump; done
+```
+
+Applying from a laptop works too (`stacks --vm isws bump --apply`), but the
+deploy still has to happen on the machine, so it is usually less confusing to do
+both there.
+
 `stacks bump --apply --deploy` collapses the last four steps for when you are
-confident. It only pulls and re-ups the stacks whose tags actually changed.
+confident. It only pulls and re-ups the stacks whose tags actually changed. Do
+not use it from a laptop — `--deploy` talks to the local Docker daemon, which is
+not the VM's.
 
 ## Declaring what to track
 
@@ -78,7 +96,7 @@ move from v3 to v4, read the upgrade notes, then widen the regex.
 Edit the tag in `.env` and converge:
 
 ```sh
-$EDITOR stacks/traefik/.env      # back to the previous tag
+$EDITOR stacks/isws/traefik/.env   # back to the previous tag
 stacks up traefik
 ```
 
@@ -111,11 +129,11 @@ stop the VM from booting.
 
 ## Why the weekly timer only reports
 
-`systemd/isws-stacks-bump.timer` runs `stacks bump` — the dry run — and writes to
-the journal:
+`systemd/vm-stacks-bump.timer` runs `stacks bump` — the dry run — and writes to
+the journal. Being on the VM, it reports on that VM's stacks only:
 
 ```sh
-journalctl -u isws-stacks-bump --since '1 week ago'
+journalctl -u vm-stacks-bump --since '1 week ago'
 ```
 
 Making it `--apply --deploy` would let an unreviewed image change take the site
