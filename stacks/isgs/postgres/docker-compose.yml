@@ -1,0 +1,73 @@
+# Shared PostgreSQL server for this VM.
+#
+# It is reachable only from the private `db` network, never from Traefik: nothing
+# here joins `edge` and no host port is bound, so the cluster is unroutable from
+# the internet by construction rather than by configuration someone could forget.
+# An application stack that needs the database adds `db` to its NETWORKS and
+# connects to host `postgres`, port 5432.
+#
+# To reach it from the VM itself, go through the container rather than opening a
+# port:
+#   docker exec -it postgres psql -U "$POSTGRES_ADMIN_USER" postgres
+
+services:
+  postgres:
+    image: postgres:${POSTGRES_TAG}
+    container_name: postgres
+    restart: unless-stopped
+
+    # A checkpoint on shutdown can outlast Compose's 10s default, and a SIGKILL
+    # mid-checkpoint means crash recovery on the next start.
+    stop_grace_period: 1m
+
+    environment:
+      - POSTGRES_USER=${POSTGRES_ADMIN_USER}
+      # Left as `postgres` on purpose: the entrypoint skips creating a database
+      # when POSTGRES_DB is the default, so first boot leaves exactly the
+      # cluster initdb makes and nothing named after the admin role.
+      - POSTGRES_DB=postgres
+      - POSTGRES_INITDB_ARGS=${POSTGRES_INITDB_ARGS}
+      # From secrets.enc.env. The ${VAR:?...} form turns a missing secret into a
+      # clear startup error instead of a database nobody can log in to.
+      #
+      # This lands in the container environment, so it is readable via
+      # `docker inspect` to anyone in the `docker` group -- which is
+      # root-equivalent on this host anyway. See docs/secrets.md.
+      - POSTGRES_PASSWORD=${POSTGRES_ADMIN_PASSWORD:?POSTGRES_ADMIN_PASSWORD missing from secrets.enc.env}
+
+    volumes:
+      # Mounted at /var/lib/postgresql, NOT at the old /var/lib/postgresql/data:
+      # the postgres:18 image moved PGDATA to /var/lib/postgresql/<major>/docker
+      # and declares the parent as its volume. Mounting the 17-and-earlier path
+      # here would leave the real data directory inside the container's writable
+      # layer and lose the cluster on the next `up`.
+      #
+      # The host directory is created by the daemon if absent and the entrypoint
+      # makes and chowns 18/docker underneath it as root, so nothing needs
+      # preparing by hand.
+      - ${POSTGRES_DATA_DIR}:/var/lib/postgresql
+
+    networks:
+      - db
+
+    # Postgres puts parallel-query and hash-join scratch space in /dev/shm;
+    # Docker's 64M default is what makes large queries fail with "could not
+    # resize shared memory segment".
+    shm_size: 256mb
+
+    healthcheck:
+      # Doubled '$' -- this is a literal dollar typed into this file, expanded by
+      # the shell inside the container, not by Compose interpolation.
+      test: ["CMD-SHELL", "pg_isready -q -U $${POSTGRES_USER} -d postgres"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      # initdb on an empty /data directory takes appreciably longer than a
+      # restart against an existing cluster.
+      start_period: 60s
+
+networks:
+  # Created by `stacks up` from NETWORKS= in stack.conf. Application stacks join
+  # it as `external: true` as well.
+  db:
+    external: true
