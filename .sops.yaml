@@ -47,7 +47,8 @@ creation_rules:
   # Laptop only until the VM is bootstrapped -- see the isgs note above.
   - path_regex: stacks/odsc/.*secrets\.enc\.(env|yaml|json)$
     age: >-
-      age1p0ucq5gllknvjdhnya06xjz8fl67nua5ddt7g5l88tcetv5e03ys3f25ex
+      age1p0ucq5gllknvjdhnya06xjz8fl67nua5ddt7g5l88tcetv5e03ys3f25ex,
+      age1a2kyj22nt8sqp0k0vf8eljzv49deplfgucjpxsgqjdtad9eg5qzsjhyh40
 
   # --- catch-all -----------------------------------------------------------
   # Anything encrypted outside a VM directory. No VM key belongs here: a secret
