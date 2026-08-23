@@ -112,6 +112,48 @@ percent-decoded. Generate it with `openssl rand -hex 32`, not
 job sets it with a quoted psql literal — so this constraint comes entirely from
 the connection string.
 
+## Basic auth
+
+Traefik requires a basic-auth credential for every request to
+`${WATERDB_HOST}` — there is no unauthenticated path, static assets included.
+It is **one shared credential**, username `demo`, not per-user accounts.
+
+The credential lives in `secrets.enc.env` as `WATERDB_AUTH`, a single htpasswd
+line (`demo:$2y$05$...`, bcrypt). Two labels in
+[`docker-compose.yml`](docker-compose.yml) put it in front of the router: one
+defining the `waterdb-auth` middleware, one attaching it. Only the hash is
+stored anywhere in this repo; the password itself is not recoverable from it, so
+keep it in a password manager when you hand it out.
+
+The bcrypt cost is htpasswd's default (5) on purpose. Traefik re-verifies the
+hash on *every* request rather than caching a session, so a page load pays it
+once per asset — `-C 12` would add a quarter-second to each of those.
+
+### Rotating it
+
+```sh
+stacks --vm isgs edit-secrets waterdb    # change WATERDB_AUTH
+git commit -am 'isgs: rotate waterdb demo credential'
+stacks --vm isgs up waterdb              # `up`, not `restart` -- see docs/secrets.md
+```
+
+Generate the replacement line with `htpasswd -nbB demo "$(openssl rand -base64 24)"`,
+and **do not double the `$` characters** in it. Compose interpolation is
+single-pass, so a `$` inside the value is never re-read; the `$$` rule applies
+only to a `$` typed literally into `docker-compose.yml`.
+
+Because this only changes the application container's labels, note that `up`
+still recreates all three containers and re-runs the seed — see above. Confirm
+the new credential took, and that the old one no longer works:
+
+```sh
+curl -s -o /dev/null -w '%{http_code}\n' https://waterdb.isgs.prairie.illinois.edu/
+# 401 -- no credential
+curl -s -o /dev/null -w '%{http_code}\n' -u demo:'the-new-value' \
+  https://waterdb.isgs.prairie.illinois.edu/
+# 200
+```
+
 ## Rotating the database password
 
 ```sh
