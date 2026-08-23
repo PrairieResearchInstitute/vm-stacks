@@ -67,6 +67,15 @@ services:
       traefik.http.routers.waterdb.tls.certResolver: le
       # Container-side port: the image sets PORT=3000 and exposes it.
       traefik.http.services.waterdb.loadbalancer.server.port: "3000"
+      # Everything behind this host is gated on the shared `demo` credential in
+      # secrets.enc.env. Middleware names, like the router name above, must be
+      # unique across every container on this VM -- hence the stack name.
+      traefik.http.routers.waterdb.middlewares: waterdb-auth
+      # WATERDB_AUTH is an htpasswd line, e.g. demo:$2y$05$....
+      # The '$' characters need no doubling: the value arrives via interpolation
+      # and interpolated values are not re-interpolated. The $$ rule only
+      # applies to '$' typed literally into this file. See docs/secrets.md.
+      traefik.http.middlewares.waterdb-auth.basicauth.users: ${WATERDB_AUTH:?WATERDB_AUTH missing from secrets.enc.env}
 
   # One-shot provisioning job: creates -- or reconciles -- this stack's role and
   # database in the shared postgres cluster, then exits. See provision-db.sh.
