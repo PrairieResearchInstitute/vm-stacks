@@ -1,0 +1,386 @@
+# Dagster orchestration for the ISGS water data application: three long-lived
+# containers published through the shared Traefik proxy, plus a one-shot job that
+# prepares Dagster's own database in the shared postgres cluster.
+#
+# ONE IMAGE, FOUR ROLES. Dagster requires its core version to match exactly
+# across every process, so the code location, the webserver, the daemon and every
+# run container are all the same image, selected by `command`. Its tag must stay
+# in step with WATERDB_TAG in ../waterdb/.env -- see stack.conf.
+#
+#   dagster-provision   reconciles Dagster's own role and database in the shared
+#                       cluster, over its Unix socket
+#           |  service_completed_successfully
+#   dagster-code        loads the definitions and serves them over gRPC on 4000
+#           |  service_healthy
+#   dagster-web         the UI, behind Traefik and basic auth
+#   dagster-daemon      ticks the sensors and launches runs
+#
+# A fifth kind of container exists but is not declared here: one RUN CONTAINER
+# per run, created at runtime by the DockerRunLauncher directly against the
+# host's Docker API. Those are configured in dagster.yaml, not here, and they
+# inherit nothing from this file -- see the comments there.
+#
+# Nothing here can depend_on the postgres stack's service: that is a separate
+# Compose project, and depends_on only resolves names within one. The head of the
+# chain waits for the cluster itself -- see provision-db.sh.
+#
+# TWO DATABASES ON ONE CLUSTER. DATABASE_URL below points at the APPLICATION
+# database, whose tables the assets read and write. Dagster's own instance
+# storage is a separate database, configured in dagster.yaml and reached as the
+# `dagster` role. Do not conflate them.
+
+services:
+  # One-shot provisioning job: creates -- or reconciles -- the role and database
+  # Dagster keeps its instance storage in, then exits. See provision-db.sh.
+  #
+  # It authenticates over the cluster's Unix socket, where pg_hba.conf says
+  # `local all all trust`, so it needs no admin password and none has to be
+  # copied into this stack's secrets. Mounting that socket directory is
+  # equivalent to being a superuser on the cluster; see the postgres stack's
+  # README.md.
+  #
+  # It leaves an `Exited (0)` container behind on purpose: that is the record it
+  # ran, and `docker logs dagster-provision` says what it did. `stacks status`
+  # therefore reports this stack as 3/4 running rather than 4/4, which is correct
+  # and not a fault.
+  dagster-provision:
+    # The same image the postgres stack runs, so the host holds one copy of it.
+    image: postgres:${POSTGRES_TAG}
+    container_name: dagster-provision
+
+    # Not `unless-stopped`: this is a job. A failure has to stay visible as
+    # Exited (1) rather than thrash, and a success must not be restarted.
+    restart: "no"
+
+    # It talks to the database over a filesystem socket and to nothing else, so
+    # it needs no network at all.
+    network_mode: none
+
+    # Replaces the image's entrypoint outright: this container must not try to be
+    # a server. Invoked via `bash <path>` so the mounted file's mode does not
+    # matter.
+    entrypoint: ["bash", "/provision-db.sh"]
+
+    environment:
+      - POSTGRES_ADMIN_USER=${POSTGRES_ADMIN_USER}
+      - DAGSTER_DB_NAME=${DAGSTER_DB_NAME}
+      - DAGSTER_DB_USER=${DAGSTER_DB_USER}
+      # From secrets.enc.env. Changing it changes this service's configuration,
+      # so `up` recreates the container and the job re-runs -- which is how a
+      # rotated password reaches the role. `up`, not `restart`; see
+      # docs/secrets.md.
+      - DAGSTER_DB_PASSWORD=${DAGSTER_DB_PASSWORD:?DAGSTER_DB_PASSWORD missing from secrets.enc.env}
+
+    volumes:
+      # Relative to this file's directory, which is where `stacks` runs compose
+      # from.
+      - ./provision-db.sh:/provision-db.sh:ro
+      # Where the postgres stack publishes its socket. Read-only: connecting to a
+      # socket does not write to the directory it sits in, and this job has no
+      # business creating anything in the host's /run.
+      #
+      # Must match POSTGRES_SOCKET_DIR in the postgres stack's .env.
+      - ${POSTGRES_SOCKET_DIR}:/var/run/postgresql:ro
+
+    # No `user:`: running as root is what keeps the socket reachable whatever
+    # mode the postgres entrypoint leaves its directory in.
+
+  # The code location. Loads the definitions once and serves them over gRPC; the
+  # webserver and the daemon both ask it rather than importing the code
+  # themselves.
+  #
+  # No `command`: the image's default CMD is
+  #   dagster api grpc -h 0.0.0.0 -p 4000 -m isgs_dagster.definitions
+  dagster-code:
+    image: ghcr.io/prairieresearchinstitute/isgs_waterdb-dagster:${DAGSTER_TAG}
+    container_name: dagster-code
+    restart: unless-stopped
+    # Reap zombies and forward signals; the image's reference deployment
+    # sets this on all three.
+    init: true
+
+    environment:
+      # How the run launcher learns which image to start for a run. It must be
+      # the fully qualified tag INCLUDING the -dagster suffix: get it wrong and
+      # runs either fail to start or silently execute the wrong code.
+      #
+      # Set here rather than in dagster.yaml so DAGSTER_TAG in .env stays the one
+      # place the tag is written.
+      - DAGSTER_CURRENT_IMAGE=ghcr.io/prairieresearchinstitute/isgs_waterdb-dagster:${DAGSTER_TAG}
+
+      # This process has no DAGSTER_HOME and no dagster.yaml, but it still needs
+      # the storage password: the daemon evaluates sensors by calling into THIS
+      # server, and discover_s3_folders reads context.instance to list dynamic
+      # partitions -- which rehydrates the Postgres storage here and resolves
+      # `env: DAGSTER_PG_PASSWORD` in this environment. Unset, every tick errors.
+      - DAGSTER_PG_PASSWORD=${DAGSTER_DB_PASSWORD:?DAGSTER_DB_PASSWORD missing from secrets.enc.env}
+      - ISGS_SCRATCH_DIR=/scratch
+
+      # The APPLICATION database -- host `postgres` on the `db` network, the role
+      # and database the waterdb stack provisions. Not Dagster's own instance
+      # storage, which is configured in dagster.yaml as the `dagster` role.
+      - DATABASE_URL=postgresql://${WATERDB_DB_USER}:${WATERDB_DB_PASSWORD:?WATERDB_DB_PASSWORD missing from secrets.enc.env}@postgres:5432/${WATERDB_DB_NAME}
+
+      # The object store. Off-host, so this needs outbound HTTPS on a
+      # non-standard port -- there is no object store container on this VM.
+      #
+      # This process needs them despite runs executing elsewhere: the daemon
+      # evaluates sensors by asking THIS server over gRPC, so discover_s3_folders
+      # makes its S3 calls here.
+      # From secrets.enc.env. The ${VAR:?...} form documents which secrets this
+      # stack needs and turns a missing one into a clear startup error instead of
+      # an application that comes up and cannot read its data.
+      #
+      # These land in the container environment, so they are readable via
+      # `docker inspect` to anyone in the `docker` group -- root-equivalent on
+      # this host anyway. See docs/secrets.md.
+      - S3_ENDPOINT=${S3_ENDPOINT:?S3_ENDPOINT missing from secrets.enc.env}
+      - S3_ACCESS_KEY=${S3_ACCESS_KEY:?S3_ACCESS_KEY missing from secrets.enc.env}
+      - S3_SECRET_KEY=${S3_SECRET_KEY:?S3_SECRET_KEY missing from secrets.enc.env}
+      # The SECOND object store. TaigaResource in the image's resources.py is
+      # distinct from ObjectStoreResource above: discover_s3_folders and
+      # processed_graph_files read bucket `graphing-data` through this one, while
+      # data_logger and sonde_data use S3_* against URIs held in the application
+      # database. Both resolve at resource-init time.
+      - TAIGA_ENDPOINT=${TAIGA_ENDPOINT:?TAIGA_ENDPOINT missing from secrets.enc.env}
+      - TAIGA_ACCESS_KEY=${TAIGA_ACCESS_KEY:?TAIGA_ACCESS_KEY missing from secrets.enc.env}
+      - TAIGA_SECRET_KEY=${TAIGA_SECRET_KEY:?TAIGA_SECRET_KEY missing from secrets.enc.env}
+
+      # Deliberately NO DAGSTER_HOME here, and none in the image: this process
+      # needs no instance, and an image-level ENV would leak into the run
+      # containers and let them create a stray SQLite instance of their own.
+
+    # No dagster.yaml or workspace.yaml mount either -- only the webserver and
+    # the daemon read those. This process is given its module by the default CMD.
+    networks:
+      - db
+
+    # There is no curl in this image (a python:slim base), so the healthcheck is
+    # Dagster's own gRPC probe rather than an HTTP request.
+    healthcheck:
+      test: ["CMD", "dagster", "api", "grpc-health-check", "-p", "4000", "-h", "127.0.0.1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      # Loading the definitions imports the project and its dependencies.
+      start_period: 60s
+
+    # Not started until Dagster's database exists. It does not use that database
+    # itself, but starting the chain here means one failed provisioning job
+    # leaves the whole stack down with a clear cause, rather than a webserver up
+    # and erroring on every page.
+    depends_on:
+      dagster-provision:
+        condition: service_completed_successfully
+
+    # The sensors tick every 30 seconds and each tick is logged. Left at the
+    # daemon default these files grow without bound.
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  # The UI. Published through Traefik, behind basic auth; no host port.
+  dagster-web:
+    image: ghcr.io/prairieresearchinstitute/isgs_waterdb-dagster:${DAGSTER_TAG}
+    container_name: dagster-web
+    restart: unless-stopped
+    # Reap zombies and forward signals; the image's reference deployment
+    # sets this on all three.
+    init: true
+
+    # The workspace path is written out in full rather than as
+    # $DAGSTER_HOME/workspace.yaml: Compose would interpolate that itself, to
+    # empty, and this is exec form so no shell in the container ever sees it.
+    command: ["dagster-webserver", "-h", "0.0.0.0", "-p", "3000",
+              "-w", "/opt/dagster/dagster_home/workspace.yaml"]
+
+    environment:
+      # Set per-service, not in the image -- see dagster-code above for why.
+      - DAGSTER_HOME=/opt/dagster/dagster_home
+      # Baked into the image ENV as well; set explicitly because
+      # run_launcher.env_vars lists it as a bare name, which is resolved against
+      # THIS process's environment and raises if unset.
+      - ISGS_SCRATCH_DIR=/scratch
+      # Read by dagster.yaml's storage block via its `env:` form.
+      - DAGSTER_PG_PASSWORD=${DAGSTER_DB_PASSWORD:?DAGSTER_DB_PASSWORD missing from secrets.enc.env}
+
+      # EVERY variable listed in run_launcher.config.env_vars in dagster.yaml has
+      # to be set here too, and identically on dagster-daemon. Those entries are
+      # bare names, which the launcher resolves against the environment of
+      # whichever process launches the run -- and it raises if one is unset. The
+      # webserver is one of those processes: it launches a run whenever someone
+      # clicks Materialize. Keep the three lists in step.
+      - DATABASE_URL=postgresql://${WATERDB_DB_USER}:${WATERDB_DB_PASSWORD:?WATERDB_DB_PASSWORD missing from secrets.enc.env}@postgres:5432/${WATERDB_DB_NAME}
+      - S3_ENDPOINT=${S3_ENDPOINT:?S3_ENDPOINT missing from secrets.enc.env}
+      - S3_ACCESS_KEY=${S3_ACCESS_KEY:?S3_ACCESS_KEY missing from secrets.enc.env}
+      - S3_SECRET_KEY=${S3_SECRET_KEY:?S3_SECRET_KEY missing from secrets.enc.env}
+      # The SECOND object store. TaigaResource in the image's resources.py is
+      # distinct from ObjectStoreResource above: discover_s3_folders and
+      # processed_graph_files read bucket `graphing-data` through this one, while
+      # data_logger and sonde_data use S3_* against URIs held in the application
+      # database. Both resolve at resource-init time.
+      - TAIGA_ENDPOINT=${TAIGA_ENDPOINT:?TAIGA_ENDPOINT missing from secrets.enc.env}
+      - TAIGA_ACCESS_KEY=${TAIGA_ACCESS_KEY:?TAIGA_ACCESS_KEY missing from secrets.enc.env}
+      - TAIGA_SECRET_KEY=${TAIGA_SECRET_KEY:?TAIGA_SECRET_KEY missing from secrets.enc.env}
+
+    volumes:
+      # The image ships neither file; this repo owns both. Read-only -- Dagster
+      # only reads them. Relative to this file's directory.
+      - ./dagster.yaml:/opt/dagster/dagster_home/dagster.yaml:ro
+      - ./workspace.yaml:/opt/dagster/dagster_home/workspace.yaml:ro
+
+      # Shared with the daemon AND with every run container, which mount the same
+      # two host directories via container_kwargs.volumes in dagster.yaml. Op
+      # stdout/stderr is written under the first one and read back from it by this
+      # UI; without all three agreeing, a finished run shows no logs at all and
+      # nothing looks broken. Keep in step with dagster.yaml.
+      - ${DAGSTER_STORAGE_DIR}:/opt/dagster/dagster_home/storage
+      - ${DAGSTER_SCRATCH_DIR}:/scratch
+
+      # ROOT-EQUIVALENT ACCESS TO THIS HOST. Anything that can talk to this
+      # socket can start a privileged container and own the machine. It is here
+      # because the run launcher runs in-process: this UI needs it to terminate a
+      # run and to answer canTerminate.
+      #
+      # Read-WRITE deliberately, and do not "harden" it to :ro -- creating and
+      # killing containers are API calls over the socket, which a read-only bind
+      # does not prevent. It would look safer and change nothing.
+      #
+      # DO NOT WIDEN THIS. If the threat model tightens, put a socket proxy in
+      # front of it and grant only the container endpoints; see
+      # docs/adding-a-stack.md.
+      - /var/run/docker.sock:/var/run/docker.sock
+
+    networks:
+      - edge
+      - db
+
+    # Waits for the definitions to be loadable so the first page served is not an
+    # error. The webserver would otherwise start and report the location as
+    # failed until the code server caught up.
+    depends_on:
+      dagster-code:
+        condition: service_healthy
+
+    labels:
+      traefik.enable: "true"
+      # Required, not optional: this container is on both `edge` and `db`, and
+      # without this label Traefik has two addresses to choose between and may
+      # route to the one it cannot reach.
+      traefik.docker.network: edge
+      # Router, service and middleware names must be unique across every
+      # container on this VM -- Traefik reads all of their labels at once -- hence
+      # the stack name.
+      traefik.http.routers.dagster.rule: Host(`${DAGSTER_HOST}`)
+      traefik.http.routers.dagster.entryPoints: websecure
+      traefik.http.routers.dagster.tls.certResolver: le
+      # Container-side port: the webserver's `command` above binds 3000. No host
+      # port is published, here or anywhere in this repo except Traefik's own
+      # 80/443, so the waterdb application's 3000 is not in conflict.
+      traefik.http.services.dagster.loadbalancer.server.port: "3000"
+      # DAGSTER OSS SHIPS NO AUTHENTICATION. This middleware is the only thing in
+      # front of the UI, and the UI can launch and terminate runs -- that is code
+      # execution on this VM, not a read-only view like waterdb's. Never publish
+      # this router without it, and treat the credential accordingly.
+      traefik.http.routers.dagster.middlewares: dagster-auth
+      # DAGSTER_AUTH is an htpasswd line, e.g. dagster:$2y$05$....
+      # The '$' characters need no doubling: the value arrives via interpolation
+      # and interpolated values are not re-interpolated. The $$ rule only applies
+      # to '$' typed literally into this file. See docs/secrets.md.
+      traefik.http.middlewares.dagster-auth.basicauth.users: ${DAGSTER_AUTH:?DAGSTER_AUTH missing from secrets.enc.env}
+
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  # The daemon. Required, not optional: it is the only process that ticks the
+  # sensors, so without it nothing is ever ingested. It is also what launches
+  # queued runs and enforces run_queue in dagster.yaml.
+  #
+  # Off `edge`: nothing should reach it from the proxy.
+  dagster-daemon:
+    image: ghcr.io/prairieresearchinstitute/isgs_waterdb-dagster:${DAGSTER_TAG}
+    container_name: dagster-daemon
+    restart: unless-stopped
+    # Reap zombies and forward signals; the image's reference deployment
+    # sets this on all three.
+    init: true
+
+    # -w is NOT optional, even though dagster.yaml and workspace.yaml are both
+    # mounted. With no target, dagster's CLI checks pyproject.toml BEFORE
+    # workspace.yaml (_get_workspace_load_target_from_cli_opts), and the image's
+    # WORKDIR /app holds a pyproject.toml with a [tool.dg] block. The daemon
+    # would therefore load the definitions IN-PROCESS, ignore this file, and hand
+    # the run launcher an origin with container_image=None -- so every
+    # sensor-triggered run would fail with "No docker image specified by the
+    # instance config or repository" while UI-clicked runs kept working.
+    #
+    # The image's own reference compose omits this; it is wrong.
+    command: ["dagster-daemon", "run",
+              "-w", "/opt/dagster/dagster_home/workspace.yaml"]
+
+    environment:
+      - DAGSTER_HOME=/opt/dagster/dagster_home
+      # Baked into the image ENV as well; set explicitly because
+      # run_launcher.env_vars lists it as a bare name, which is resolved against
+      # THIS process's environment and raises if unset.
+      - ISGS_SCRATCH_DIR=/scratch
+      - DAGSTER_PG_PASSWORD=${DAGSTER_DB_PASSWORD:?DAGSTER_DB_PASSWORD missing from secrets.enc.env}
+
+      # This process uses none of the four below itself -- the assets that read
+      # them run in the run containers. They are here because
+      # run_launcher.config.env_vars in dagster.yaml lists them as bare names,
+      # which the launcher copies from the launching process and raises on if
+      # unset. This is the launching process for every sensor-triggered run.
+      #
+      # Identical to dagster-web's list above, deliberately. A variable added to
+      # dagster.yaml has to be added in three places.
+      - DATABASE_URL=postgresql://${WATERDB_DB_USER}:${WATERDB_DB_PASSWORD:?WATERDB_DB_PASSWORD missing from secrets.enc.env}@postgres:5432/${WATERDB_DB_NAME}
+      - S3_ENDPOINT=${S3_ENDPOINT:?S3_ENDPOINT missing from secrets.enc.env}
+      - S3_ACCESS_KEY=${S3_ACCESS_KEY:?S3_ACCESS_KEY missing from secrets.enc.env}
+      - S3_SECRET_KEY=${S3_SECRET_KEY:?S3_SECRET_KEY missing from secrets.enc.env}
+      # The SECOND object store. TaigaResource in the image's resources.py is
+      # distinct from ObjectStoreResource above: discover_s3_folders and
+      # processed_graph_files read bucket `graphing-data` through this one, while
+      # data_logger and sonde_data use S3_* against URIs held in the application
+      # database. Both resolve at resource-init time.
+      - TAIGA_ENDPOINT=${TAIGA_ENDPOINT:?TAIGA_ENDPOINT missing from secrets.enc.env}
+      - TAIGA_ACCESS_KEY=${TAIGA_ACCESS_KEY:?TAIGA_ACCESS_KEY missing from secrets.enc.env}
+      - TAIGA_SECRET_KEY=${TAIGA_SECRET_KEY:?TAIGA_SECRET_KEY missing from secrets.enc.env}
+
+    volumes:
+      - ./dagster.yaml:/opt/dagster/dagster_home/dagster.yaml:ro
+      - ./workspace.yaml:/opt/dagster/dagster_home/workspace.yaml:ro
+      - ${DAGSTER_STORAGE_DIR}:/opt/dagster/dagster_home/storage
+      - ${DAGSTER_SCRATCH_DIR}:/scratch
+      # ROOT-EQUIVALENT ACCESS TO THIS HOST -- see the identical mount on
+      # dagster-web above, which explains why it is read-write and why it must
+      # not be widened. This is the container that actually creates a run
+      # container per run.
+      - /var/run/docker.sock:/var/run/docker.sock
+
+    networks:
+      - db
+
+    depends_on:
+      dagster-code:
+        condition: service_healthy
+
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+networks:
+  # Both created by `stacks up` from NETWORKS= in stack.conf.
+  edge:
+    external: true
+  # The postgres stack's private network. Also the network the run launcher
+  # attaches each run container to; see dagster.yaml.
+  db:
+    external: true

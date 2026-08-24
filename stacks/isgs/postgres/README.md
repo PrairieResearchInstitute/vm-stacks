@@ -117,6 +117,7 @@ Stacks that mount it today:
 | Stack | What it mounts it for |
 | --- | --- |
 | [`waterdb`](../waterdb/) | `waterdb-provision`, read-only — reconciles its own role and database |
+| [`dagster`](../dagster/) | `dagster-provision`, read-only — reconciles the role and database Dagster keeps its instance storage in |
 
 Check it from the host:
 
