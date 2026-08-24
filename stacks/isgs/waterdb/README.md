@@ -156,10 +156,18 @@ curl -s -o /dev/null -w '%{http_code}\n' -u demo:'the-new-value' \
 
 ## Rotating the database password
 
+> [!IMPORTANT]
+> `WATERDB_DB_PASSWORD` and the three `S3_*` values are also held in
+> [`../dagster/secrets.enc.env`](../dagster/), because Dagster reads the same
+> bucket and writes this application's tables. **Rotating any of them means
+> editing both files and bringing both stacks up.** Nothing detects the drift; it
+> surfaces as an authentication failure the next time a Dagster sensor ticks.
+
 ```sh
 stacks --vm isgs edit-secrets waterdb    # change WATERDB_DB_PASSWORD
+stacks --vm isgs edit-secrets dagster    # ...and the copy there
 git commit -am 'isgs: rotate waterdb database password'
-stacks --vm isgs up waterdb              # `up`, not `restart` -- see docs/secrets.md
+stacks --vm isgs up waterdb dagster      # `up`, not `restart` -- see docs/secrets.md
 ```
 
 The changed value alters every one of these containers' configuration, so `up`

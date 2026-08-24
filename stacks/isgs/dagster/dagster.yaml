@@ -1,0 +1,162 @@
+# Dagster instance configuration. Bind-mounted read-only at
+# $DAGSTER_HOME/dagster.yaml on the webserver and the daemon.
+#
+# The image ships no copy of this file -- this repo owns it. It is NOT mounted
+# into run containers: the run launcher serialises the whole instance config into
+# each run container's argv instead, which is also why the paths below are
+# written out literally rather than composed from environment variables.
+#
+# This file is read by Dagster, not by Compose. `${...}` is not interpolated
+# here; a value that has to come from the environment uses the `env:` form below.
+
+# Instance storage: run, event log, schedule and dynamic partition tables.
+#
+# Postgres, not the SQLite default, and not optional. The webserver, the daemon
+# and every run container are separate processes that have to share these
+# tables; SQLite would give each of them its own.
+#
+# Host `postgres` is the shared cluster on the `db` network -- a separate Compose
+# project, see docker-compose.yml. Database and role `dagster` are what
+# provision-db.sh reconciles; they are Dagster's own, and distinct from the
+# application database its assets read (DATABASE_URL in docker-compose.yml).
+storage:
+  postgres:
+    postgres_db:
+      hostname: postgres
+      port: 5432
+      db_name: dagster
+      username: dagster
+      # DAGSTER_PG_PASSWORD is set from DAGSTER_DB_PASSWORD in secrets.enc.env by
+      # docker-compose.yml, on the webserver and the daemon.
+      password:
+        env: DAGSTER_PG_PASSWORD
+
+# Caps how much work the daemon will run at once.
+#
+# Not cosmetic: all three sensors tick every 30 seconds, and discover_s3_folders
+# can request up to 25 runs in a single tick. The asset those runs target loads
+# an entire .xlsx workbook into memory.
+#
+# The asset carries op_tags={"warehouse": "in_use"}, which is inert unless a
+# matching tag_concurrency_limits entry exists here -- the tag on its own limits
+# nothing. Setting `run_queue` at all is what puts the queued run coordinator in
+# front of the launcher; without it every requested run starts immediately.
+run_queue:
+  max_concurrent_runs: 8
+  tag_concurrency_limits:
+    - key: warehouse
+      value: in_use
+      limit: 2
+
+# One throwaway container per run, created directly against the host's Docker
+# API by the daemon (and by the webserver, when someone clicks Materialize).
+# REQUIRED because container_kwargs sets mem_limit below. run_monitoring is off
+# by default in 1.13.6 (settings_methods.py: .get("enabled", False)). An
+# OOM-killed run container writes no failure event, and auto_remove has already
+# deleted it, so without this the run sits in STARTED forever -- holding one of
+# max_concurrent_runs and one of the two warehouse=in_use slots. Two of those and
+# nothing ever runs again.
+#
+# max_resume_run_attempts: 0 -- mark it failed, do not try to resume it.
+run_monitoring:
+  enabled: true
+  start_timeout_seconds: 300
+  max_resume_run_attempts: 0
+
+run_launcher:
+  module: dagster_docker
+  class: DockerRunLauncher
+  config:
+    # No `image:` key on purpose. The launcher takes the image from
+    # DAGSTER_CURRENT_IMAGE on the code location service, which
+    # docker-compose.yml builds from DAGSTER_TAG -- so the tag stays defined in
+    # exactly one place. Compose does not interpolate this file, so an `image:`
+    # here would be a second, hard-coded copy of the tag to forget.
+
+    # Run containers start with an EMPTY environment: the launcher passes only
+    # what is listed here, plus DAGSTER_RUN_JOB_NAME. Nothing is inherited.
+    #
+    # The bare KEY form copies the value from the LAUNCHING process and raises if
+    # it is unset, which is why the daemon service carries all of these even
+    # though it uses none of them itself.
+    #
+    # DAGSTER_HOME is deliberately absent: run containers do not need it, and one
+    # would let them create a stray SQLite instance of their own.
+    # This list is the image's own, from deploy/dagster.yaml.example in the
+    # isgs_dagster repo. All three resources in resources.py resolve their
+    # dg.EnvVar(...) at init time inside the run container, and there are TWO
+    # object stores: ObjectStoreResource (S3_*) and TaigaResource (TAIGA_*).
+    #
+    # ISGS_SCRATCH_DIR resolves from the image's own ENV on the launching
+    # process; it is listed because the asset that writes CSVs reads it.
+    env_vars:
+      - DATABASE_URL
+      - S3_ENDPOINT
+      - S3_ACCESS_KEY
+      - S3_SECRET_KEY
+      - TAIGA_ENDPOINT
+      - TAIGA_ACCESS_KEY
+      - TAIGA_SECRET_KEY
+      - DAGSTER_PG_PASSWORD
+      - ISGS_SCRATCH_DIR
+
+    # `db`, and only `db`. Run containers are created outside Compose, so they
+    # join nothing unless named here -- and then they could reach neither the
+    # cluster nor the object store. Only the FIRST entry is attached at container
+    # creation, so a second one would be silently useless.
+    #
+    # One network covers both dependencies: `db` is an ordinary bridge, so it
+    # resolves host `postgres` and still NATs outbound to the off-host S3
+    # endpoint.
+    networks:
+      - db
+
+    # Passed through to containers.create in the Docker Python API. It REJECTS
+    # `image`, `environment` and `network` -- those are the launcher's own
+    # `image`, `env_vars` and `networks` keys above.
+    container_kwargs:
+      # Discarded on exit. The diagnostics worth keeping already outlive the
+      # container: structured events in the postgres instance storage above, and
+      # op stdout/stderr on the storage mount below. Left as false, one
+      # discover_s3_folders tick could leave 25 exited containers behind, and
+      # Compose's `logging:` does not apply to containers it did not create.
+      #
+      # Set it to false temporarily to debug a run container that dies before
+      # Dagster can record anything -- a bad image or a failed entrypoint.
+      auto_remove: true
+
+      # The asset loads whole workbooks into memory, and tag_concurrency_limits
+      # above allows two of those at once. Size this against the VM's RAM and the
+      # largest workbook; memswap_limit equal to mem_limit disables swap, so an
+      # oversized one is OOM-killed with a clear signal instead of thrashing the
+      # host.
+      mem_limit: 2g
+      memswap_limit: 2g
+
+      # Raw host paths, and they MUST match DAGSTER_STORAGE_DIR and
+      # DAGSTER_SCRATCH_DIR in .env, which is where the webserver and the daemon
+      # mount the same two directories. Nothing checks that they agree.
+      #
+      # This is not decoration. Dagster's compute log manager writes op
+      # stdout/stderr under $DAGSTER_HOME/storage, and that resolved path is
+      # carried into each run container. Without the same directory mounted on
+      # all three, the UI shows no logs at all for any run -- and every container
+      # still looks perfectly healthy.
+      #
+      # Host paths rather than named volumes partly for this: the launcher talks
+      # to the Docker API and knows nothing about Compose's `<project>_` volume
+      # prefixing, so `dagster_storage` here and in Compose would resolve to two
+      # different volumes.
+      volumes:
+        - /data/dagster/storage:/opt/dagster/dagster_home/storage
+        - /data/dagster/scratch:/scratch
+
+# Sensor cursors and dynamic partitions live in instance storage and survive
+# restarts; this only trims the event log. Three sensors ticking every 30 seconds
+# is roughly 8.6k tick records a day into a database with no backup. Values from
+# the image's reference deployment.
+retention:
+  schedule:
+    purge_after_days: 90
+  sensor:
+    purge_after_days: 90

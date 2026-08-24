@@ -1,0 +1,12 @@
+# Where the webserver and the daemon find the definitions. Bind-mounted
+# read-only at $DAGSTER_HOME/workspace.yaml on both; the image ships no copy.
+#
+# A gRPC server rather than a module load, because the definitions live in a
+# long-lived container of their own: one place loads the code, and the webserver
+# and daemon both ask it over the network. `host` is the compose service name,
+# resolved on the `db` network that all three join.
+load_from:
+  - grpc_server:
+      host: dagster-code
+      port: 4000
+      location_name: isgs_dagster
