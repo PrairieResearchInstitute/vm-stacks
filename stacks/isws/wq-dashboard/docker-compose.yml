@@ -1,0 +1,54 @@
+# ISWS water quality dashboard: a single web container listening on 3000,
+# published through the shared Traefik proxy. No host port is bound and no TLS
+# is configured here -- both belong to the traefik stack.
+#
+# It has no database and no local state: its data lives in S3, reached with the
+# credentials in secrets.enc.env. Nothing to back up on this machine.
+
+services:
+  wq-dashboard:
+    image: ghcr.io/puxia2/isws-wq-dashboard:${WQ_DASHBOARD_TAG}
+    container_name: wq-dashboard
+    restart: unless-stopped
+
+    environment:
+      # From secrets.enc.env. The ${VAR:?...} form documents which secrets this
+      # stack needs and turns a missing one into a clear startup error instead
+      # of an application that comes up and cannot read its data.
+      #
+      # These land in the container environment, so they are readable via
+      # `docker inspect` to anyone in the `docker` group -- root-equivalent on
+      # this host anyway. See docs/secrets.md.
+      - S3_ENDPOINT=${S3_ENDPOINT:?S3_ENDPOINT missing from secrets.enc.env}
+      - S3_ACCESS_KEY=${S3_ACCESS_KEY:?S3_ACCESS_KEY missing from secrets.enc.env}
+      - S3_SECRET_KEY=${S3_SECRET_KEY:?S3_SECRET_KEY missing from secrets.enc.env}
+
+    networks:
+      - edge
+
+    labels:
+      traefik.enable: "true"
+      # Only one network here, so Traefik has no address to choose between --
+      # but stating it keeps the label set correct if a second one is ever added.
+      traefik.docker.network: edge
+      # Router and service names must be unique across every container on this
+      # VM -- Traefik reads all of their labels at once -- hence the stack name.
+      traefik.http.routers.wq-dashboard.rule: Host(`${WQ_DASHBOARD_HOST}`)
+      traefik.http.routers.wq-dashboard.entryPoints: websecure
+      traefik.http.routers.wq-dashboard.tls.certResolver: le
+      # Container-side port: the image serves on 3000.
+      traefik.http.services.wq-dashboard.loadbalancer.server.port: "3000"
+      # Everything behind this host is gated on the shared `demo` credential in
+      # secrets.enc.env. Middleware names, like the router name above, must be
+      # unique across every container on this VM -- hence the stack name.
+      traefik.http.routers.wq-dashboard.middlewares: wq-dashboard-auth
+      # WQ_DASHBOARD_AUTH is an htpasswd line, e.g. demo:$2y$05$....
+      # The '$' characters need no doubling: the value arrives via interpolation
+      # and interpolated values are not re-interpolated. The $$ rule only
+      # applies to '$' typed literally into this file. See docs/secrets.md.
+      traefik.http.middlewares.wq-dashboard-auth.basicauth.users: ${WQ_DASHBOARD_AUTH:?WQ_DASHBOARD_AUTH missing from secrets.enc.env}
+
+networks:
+  # Created by `stacks up` from NETWORKS= in stack.conf.
+  edge:
+    external: true
