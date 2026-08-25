@@ -38,15 +38,37 @@ services:
       traefik.http.routers.wq-dashboard.tls.certResolver: le
       # Container-side port: the image serves on 3000.
       traefik.http.services.wq-dashboard.loadbalancer.server.port: "3000"
-      # Everything behind this host is gated on the shared `demo` credential in
-      # secrets.enc.env. Middleware names, like the router name above, must be
-      # unique across every container on this VM -- hence the stack name.
-      traefik.http.routers.wq-dashboard.middlewares: wq-dashboard-auth
+      # Two middlewares, applied left to right. Auth comes FIRST so that the
+      # "no unauthenticated path" property holds for the bare host too: an
+      # anonymous GET / gets a 401, not a redirect that reveals where the
+      # application actually lives.
+      #
+      # Middleware names, like the router name above, must be unique across
+      # every container on this VM -- hence the stack name.
+      traefik.http.routers.wq-dashboard.middlewares: wq-dashboard-auth,wq-dashboard-root
+
       # WQ_DASHBOARD_AUTH is an htpasswd line, e.g. demo:$2y$05$....
       # The '$' characters need no doubling: the value arrives via interpolation
       # and interpolated values are not re-interpolated. The $$ rule only
       # applies to '$' typed literally into this file. See docs/secrets.md.
       traefik.http.middlewares.wq-dashboard-auth.basicauth.users: ${WQ_DASHBOARD_AUTH:?WQ_DASHBOARD_AUTH missing from secrets.enc.env}
+
+      # The application's real entry point is /dashboard; the bare host serves
+      # nothing. Send / and "" there, and ONLY those -- the `/?$` anchor is what
+      # keeps this off /favicon.ico, /_app/... and every other asset path. A
+      # blanket addPrefix would rewrite those too and break the page it fixed.
+      #
+      # Unlike the interpolated values above, this regex is typed literally into
+      # this file, so its '$' MUST be doubled: '$$' is how you get one '$' past
+      # Compose, and '$${1}' is the capture group Traefik's Go regexp expands.
+      # Written host-agnostically off that group so WQ_DASHBOARD_HOST stays the
+      # single place the hostname is spelled.
+      traefik.http.middlewares.wq-dashboard-root.redirectregex.regex: ^(https?://[^/]+)/?$$
+      traefik.http.middlewares.wq-dashboard-root.redirectregex.replacement: $${1}/dashboard
+      # 302, not 301. Browsers cache a permanent redirect indefinitely and
+      # ignore the server afterwards, so a 301 here would have to be un-taught
+      # from every client that ever hit it if the app later serves / itself.
+      traefik.http.middlewares.wq-dashboard-root.redirectregex.permanent: "false"
 
 networks:
   # Created by `stacks up` from NETWORKS= in stack.conf.

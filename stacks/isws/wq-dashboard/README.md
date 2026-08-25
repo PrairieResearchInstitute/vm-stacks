@@ -11,6 +11,46 @@ stacks --vm isws ps wq-dashboard      # expect 1/1 running
 stacks --vm isws logs wq-dashboard -f
 ```
 
+## The application lives at `/dashboard`
+
+The bare host serves nothing, so a `redirectRegex` middleware
+(`wq-dashboard-root`) sends the root path there:
+
+```
+https://wq-dashboard.isws.prairie.illinois.edu/  ->  302  ->  .../dashboard
+```
+
+**Only the root path.** The regex is anchored `^(https?://[^/]+)/?$`, so `/` and
+the empty path redirect and nothing else does — `/favicon.ico`, `/_app/...` and
+every other asset is passed through untouched. This is deliberately not an
+`addPrefix` middleware: that would rewrite the asset paths too and break the
+very page it was meant to fix.
+
+It is a **302, not a 301**. Browsers cache a permanent redirect indefinitely and
+stop asking the server, so a 301 would have to be un-taught from every client
+that ever hit it if the application later serves `/` itself.
+
+The two middlewares are applied in the order listed on the router —
+`wq-dashboard-auth,wq-dashboard-root` — auth first on purpose, so an anonymous
+`GET /` gets a `401` rather than a redirect advertising where the application
+actually lives.
+
+The regex is typed literally into [`docker-compose.yml`](docker-compose.yml)
+rather than arriving by interpolation, so its `$` characters **are** doubled
+there (`$$`, and `$${1}` for the capture group). That is the opposite of the
+`WQ_DASHBOARD_AUTH` rule below, and the distinction is the whole `$$` footgun:
+doubling applies to a `$` you type into the compose file, never to one that
+arrives inside an interpolated value.
+
+Behaviour, all with a valid credential unless noted:
+
+| Request | |
+| --- | --- |
+| `GET /` anonymous | `401` |
+| `GET /` | `302` → `/dashboard` |
+| `GET /dashboard` | `200` |
+| `GET /favicon.ico`, `GET /_app/...` | `200`, not redirected |
+
 ## Basic auth
 
 Traefik requires a basic-auth credential for every request to
