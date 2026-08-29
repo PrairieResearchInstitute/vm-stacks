@@ -1,0 +1,245 @@
+# Dagster orchestration for the ODSC: one long-lived container published through
+# the shared Traefik proxy, plus a one-shot job that prepares Dagster's own
+# database in the shared postgres cluster.
+#
+#   dagster-provision   reconciles Dagster's own role and database in the shared
+#                       cluster, over its Unix socket
+#           |  service_completed_successfully
+#   dagster             webserver + daemon + the code itself, behind Traefik and
+#                       basic auth
+#
+# ONE CONTAINER, NOT FOUR. The image's default CMD is `all`: it starts the daemon
+# and the webserver side by side, each spawning its own code-server subprocess
+# from the workspace baked into the image, and runs execute as subprocesses of
+# this container via DefaultRunLauncher. That is the shape dagster-pri is built
+# for -- see docs/deploy.md in that repo, which is the authority for everything
+# this file assumes.
+#
+# The split gRPC layout (a separate code location, webserver and daemon) is also
+# supported by the image, but it buys nothing here: it needs a workspace.yaml of
+# our own and one shared /opt/dagster/local volume across two of the three
+# containers, in exchange for a code server we have no second consumer for.
+#
+# NO DOCKER SOCKET. There is no DockerRunLauncher and no per-run container: the
+# image ships only the dependencies in its pyproject.toml, and dagster_docker is
+# deliberately not among them. Runs are isolated by DAGSTER_MAX_CONCURRENT_RUNS
+# and this container's own limits, not by a container boundary. Do not add a
+# /var/run/docker.sock mount to "fix" a run launcher -- the image's startup
+# preflight rejects an instance config naming a launcher it cannot import.
+#
+# Nothing here can depend_on the postgres stack's service: that is a separate
+# Compose project, and depends_on only resolves names within one. The head of the
+# chain waits for the cluster itself -- see provision-db.sh.
+#
+# ONE DATABASE. Dagster's instance storage -- runs, event log, schedules,
+# dynamic partitions -- is the whole of this stack's relational footprint. The
+# data itself lives in the object store, and there is no application database on
+# this VM.
+
+services:
+  # One-shot provisioning job: creates -- or reconciles -- the role and database
+  # Dagster keeps its instance storage in, then exits. See provision-db.sh.
+  #
+  # It authenticates over the cluster's Unix socket, where pg_hba.conf says
+  # `local all all trust`, so it needs no admin password and none has to be
+  # copied into this stack's secrets. Mounting that socket directory is
+  # equivalent to being a superuser on the cluster; see the postgres stack's
+  # README.md.
+  #
+  # It leaves an `Exited (0)` container behind on purpose: that is the record it
+  # ran, and `docker logs dagster-provision` says what it did. `stacks status`
+  # therefore reports this stack as 1/2 running rather than 2/2, which is correct
+  # and not a fault.
+  dagster-provision:
+    # The same image the postgres stack runs, so the host holds one copy of it.
+    image: postgres:${POSTGRES_TAG}
+    container_name: dagster-provision
+
+    # Not `unless-stopped`: this is a job. A failure has to stay visible as
+    # Exited (1) rather than thrash, and a success must not be restarted.
+    restart: "no"
+
+    # It talks to the database over a filesystem socket and to nothing else, so
+    # it needs no network at all.
+    network_mode: none
+
+    # Replaces the image's entrypoint outright: this container must not try to be
+    # a server. Invoked via `bash <path>` so the mounted file's mode does not
+    # matter.
+    entrypoint: ["bash", "/provision-db.sh"]
+
+    environment:
+      - POSTGRES_ADMIN_USER=${POSTGRES_ADMIN_USER}
+      - DAGSTER_DB_NAME=${DAGSTER_DB_NAME}
+      - DAGSTER_DB_USER=${DAGSTER_DB_USER}
+      # From secrets.enc.env. Changing it changes this service's configuration,
+      # so `up` recreates the container and the job re-runs -- which is how a
+      # rotated password reaches the role. `up`, not `restart`; see
+      # docs/secrets.md.
+      - DAGSTER_DB_PASSWORD=${DAGSTER_DB_PASSWORD:?DAGSTER_DB_PASSWORD missing from secrets.enc.env}
+
+    volumes:
+      # Relative to this file's directory, which is where `stacks` runs compose
+      # from.
+      - ./provision-db.sh:/provision-db.sh:ro
+      # Where the postgres stack publishes its socket. Read-only: connecting to a
+      # socket does not write to the directory it sits in, and this job has no
+      # business creating anything in the host's /run.
+      #
+      # Must match POSTGRES_SOCKET_DIR in the postgres stack's .env.
+      - ${POSTGRES_SOCKET_DIR}:/var/run/postgresql:ro
+
+    # No `user:`: running as root is what keeps the socket reachable whatever
+    # mode the postgres entrypoint leaves its directory in.
+
+  # Dagster itself: webserver, daemon and code location in one container.
+  #
+  # No `command`: the image's default CMD is ["all"]. That default is
+  # load-bearing and not obvious -- an earlier revision of this file omitted
+  # `command` on a service it believed defaulted to `dagster api grpc`, and got a
+  # webserver instead.
+  #
+  # No `init: true`: the image's ENTRYPOINT is already tini.
+  #
+  # No dagster.yaml and no workspace.yaml mount: the image ships both, and the
+  # baked instance config already reads every DAGSTER_PG_* variable below. If a
+  # future change does need to override dagster.yaml, mount it at
+  # /opt/dagster/home/dagster.yaml and KEEP its local_artifact_storage and
+  # compute_logs blocks -- dropping them does not disable local storage, it
+  # relocates it under $DAGSTER_HOME and quietly strands the volume below.
+  dagster:
+    image: ghcr.io/prairieresearchinstitute/dagster-pri:${DAGSTER_TAG}
+    container_name: dagster
+    restart: unless-stopped
+
+    environment:
+      # --- instance storage, read by the image's baked dagster.yaml ----------
+      #
+      # The cluster is reached over TCP on the `db` network, not over the socket
+      # the provisioning job uses: the baked config has no socket form.
+      - DAGSTER_PG_HOST=postgres
+      - DAGSTER_PG_PORT=5432
+      - DAGSTER_PG_DB=${DAGSTER_DB_NAME}
+      - DAGSTER_PG_USERNAME=${DAGSTER_DB_USER}
+      - DAGSTER_PG_PASSWORD=${DAGSTER_DB_PASSWORD:?DAGSTER_DB_PASSWORD missing from secrets.enc.env}
+      # Runs execute in THIS container and an ERA5 month is memory-hungry, so
+      # this cap is most of what stands between a backfill and the host's
+      # memory. Raise it deliberately.
+      - DAGSTER_MAX_CONCURRENT_RUNS=${DAGSTER_MAX_CONCURRENT_RUNS}
+
+      # --- object store ------------------------------------------------------
+      #
+      # THE NAMES ARE AWS_*, NOT S3_*. They are the standard AWS SDK variables,
+      # which is what dg.EnvVar(...) in the image's resources.py reads;
+      # S3_ENDPOINT / S3_ACCESS_KEY / S3_SECRET_KEY are read by nothing, and the
+      # image's preflight rejects a container that sets those instead.
+      #
+      # Off-host -- there is no object store on this VM -- so this needs
+      # outbound HTTPS on a non-standard port.
+      - BUCKET_NAME=${BUCKET_NAME}
+      - AWS_ENDPOINT_URL=${AWS_ENDPOINT_URL}
+      - AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID:?AWS_ACCESS_KEY_ID missing from secrets.enc.env}
+      - AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY:?AWS_SECRET_ACCESS_KEY missing from secrets.enc.env}
+
+      # --- Copernicus Climate Data Store -------------------------------------
+      #
+      # Where the raw ERA5-Land data is fetched from. No ~/.cdsapirc file is
+      # involved; the resource takes the credentials explicitly.
+      - CDSAPI_URL=${CDSAPI_URL}
+      - CDSAPI_KEY=${CDSAPI_KEY:?CDSAPI_KEY missing from secrets.enc.env}
+
+      # --- the monthly backfill sensor ---------------------------------------
+      #
+      # Without ERA5_START_YM the sensor skips every tick and nothing is ever
+      # ingested. ERA5_END_YM is deliberately empty in .env: the sensor treats an
+      # empty value as absent, which means unbounded.
+      - ERA5_START_YM=${ERA5_START_YM}
+      - ERA5_END_YM=${ERA5_END_YM}
+      - ERA5_STATE=${ERA5_STATE}
+
+    volumes:
+      # Bind mounts on /data rather than Docker named volumes, for the same
+      # reason as the postgres cluster: they have to survive a rebuild of the
+      # machine's root filesystem.
+      #
+      # BOTH MUST BE OWNED BY UID 1000. The image runs as uid/gid 1000
+      # (`dagster`), and a host directory under /data is root-owned by default,
+      # so this is a prerequisite and not a detail:
+      #
+      #   install -d -o 1000 -g 1000 /data/dagster/local /data/dagster/scratch
+      #
+      # Nothing creates them for us. The image's preflight catches a root-owned
+      # mount at startup and prints the exact chown to run; see README.md.
+
+      # Compute (step) logs and io_manager intermediates. Without this volume a
+      # finished run shows no logs at all in the UI, and nothing looks broken.
+      - ${DAGSTER_LOCAL_DIR}:/opt/dagster/local
+
+      # TMPDIR inside the image. era5_init and era5_iceberg stage a whole month
+      # of NetCDF here, so it needs room; it does not need to survive a restart.
+      # If TMPDIR is not writable Python does not fail -- it silently falls back
+      # to /tmp and fills the container's writable layer instead, which is why
+      # the ownership note above matters as much here as for the volume above.
+      - ${DAGSTER_SCRATCH_DIR}:/opt/dagster/scratch
+
+    networks:
+      - edge
+      - db
+
+    # The provisioning job has to have created the role and database before
+    # Dagster runs its schema migrations against them on first start.
+    depends_on:
+      dagster-provision:
+        condition: service_completed_successfully
+
+    # There is no curl in this image (a python:slim base), so this goes through
+    # the interpreter that is definitely present.
+    healthcheck:
+      test: ["CMD", "python", "-c",
+             "import urllib.request; urllib.request.urlopen('http://127.0.0.1:3000/server_info')"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      # Generous: the first start runs Dagster's storage migrations before the
+      # webserver binds.
+      start_period: 90s
+
+    labels:
+      traefik.enable: "true"
+      # Required, not optional: this container is on both `edge` and `db`, and
+      # without this label Traefik has two addresses to choose between and may
+      # route to the one it cannot reach.
+      traefik.docker.network: edge
+      # Router, service and middleware names must be unique across every
+      # container on this VM -- Traefik reads all of their labels at once --
+      # hence the stack name.
+      traefik.http.routers.dagster.rule: Host(`${DAGSTER_HOST}`)
+      traefik.http.routers.dagster.entryPoints: websecure
+      traefik.http.routers.dagster.tls.certResolver: le
+      # Container-side port: the webserver binds 3000. No host port is
+      # published, here or anywhere in this repo except Traefik's own 80/443.
+      traefik.http.services.dagster.loadbalancer.server.port: "3000"
+      # DAGSTER OSS SHIPS NO AUTHENTICATION. This middleware is the only thing in
+      # front of the UI, and the UI can launch and terminate runs -- that is code
+      # execution on this VM. Never publish this router without it, and treat the
+      # credential accordingly.
+      traefik.http.routers.dagster.middlewares: dagster-auth
+      # DAGSTER_AUTH is an htpasswd line, e.g. dagster:$2y$05$....
+      # The '$' characters need no doubling: the value arrives via interpolation
+      # and interpolated values are not re-interpolated. The $$ rule only applies
+      # to '$' typed literally into this file. See docs/secrets.md.
+      traefik.http.middlewares.dagster-auth.basicauth.users: ${DAGSTER_AUTH:?DAGSTER_AUTH missing from secrets.enc.env}
+
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+networks:
+  # Both created by `stacks up` from NETWORKS= in stack.conf.
+  edge:
+    external: true
+  # The postgres stack's private network, where the cluster answers on TCP.
+  db:
+    external: true
