@@ -137,6 +137,7 @@ services:
       # Off-host -- there is no object store on this VM -- so this needs
       # outbound HTTPS on a non-standard port.
       - BUCKET_NAME=${BUCKET_NAME}
+      - PRIVATE_BUCKET_NAME=${PRIVATE_BUCKET_NAME}
       - AWS_ENDPOINT_URL=${AWS_ENDPOINT_URL}
       - AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID:?AWS_ACCESS_KEY_ID missing from secrets.enc.env}
       - AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY:?AWS_SECRET_ACCESS_KEY missing from secrets.enc.env}
