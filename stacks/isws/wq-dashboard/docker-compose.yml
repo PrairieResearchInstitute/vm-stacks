@@ -23,6 +23,12 @@ services:
       - S3_ACCESS_KEY=${S3_ACCESS_KEY:?S3_ACCESS_KEY missing from secrets.enc.env}
       - S3_SECRET_KEY=${S3_SECRET_KEY:?S3_SECRET_KEY missing from secrets.enc.env}
 
+      # From .env, not secrets.enc.env: which bucket and key prefix hold the
+      # data, which is not sensitive. Plain ${VAR} -- an unset one here means a
+      # committed file was edited, not a missing secret.
+      - S3_BUCKET=${S3_BUCKET}
+      - S3_PREFIX=${S3_PREFIX}
+
     networks:
       - edge
 

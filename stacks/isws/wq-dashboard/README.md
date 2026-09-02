@@ -95,19 +95,37 @@ curl -s -o /dev/null -w '%{http_code}\n' -u demo:'the-new-value' \
 # 200
 ```
 
-## S3 credentials
+## Object store
 
-Three values in `secrets.enc.env` — `S3_ENDPOINT`, `S3_ACCESS_KEY` and
-`S3_SECRET_KEY` — point the application at its bucket on NCSA's OSN pod. They
-are injected into the container's environment, which means they are readable via
-`docker inspect` to anyone in the `docker` group; see [`docs/secrets.md`](../../../docs/secrets.md).
+The application's data lives on NCSA's OSN pod, and its configuration is split
+across the two files by sensitivity — five values in all, every one of them
+reaching the container as an environment variable.
 
-The same key pair is used by the pipeline that writes the bucket, so a rotation
-there has to be mirrored here. Nothing detects the drift — it surfaces as the
-dashboard failing to load data.
+Where the data is, in [`.env`](.env), committed:
+
+| Variable | Value | |
+| --- | --- | --- |
+| `S3_BUCKET` | `private` | the bucket |
+| `S3_PREFIX` | `tlpa/wq` | key prefix within it |
+
+How to reach it, in `secrets.enc.env` — `S3_ENDPOINT`, `S3_ACCESS_KEY` and
+`S3_SECRET_KEY`.
+
+All five are injected into the container's environment, which means the secret
+three are readable via `docker inspect` to anyone in the `docker` group; see
+[`docs/secrets.md`](../../../docs/secrets.md).
+
+Both halves are shared with the pipeline that writes the bucket: a rotated key
+pair or a moved prefix has to be mirrored here. Nothing detects the drift — it
+surfaces as the dashboard failing to load data. Changing either file changes the
+service's configuration, so reach for `up` rather than `restart`.
 
 ```sh
+# credentials
 stacks --vm isws edit-secrets wq-dashboard
+# bucket or prefix
+$EDITOR stacks/isws/wq-dashboard/.env
+
 git commit -am 'isws: rotate wq-dashboard S3 credentials'
 stacks --vm isws up wq-dashboard
 ```
