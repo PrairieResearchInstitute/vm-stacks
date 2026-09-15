@@ -1,0 +1,81 @@
+# Dedicated PostgreSQL+pgvector server for OWUI-based chatbots. Modeled
+# directly on stacks/odsc/postgres/docker-compose.yml -- see that file for
+# the fully-annotated original this copies. Kept as a SEPARATE cluster from
+# it (own container name, own network, own data directory, own socket path)
+# specifically so nothing here ever touches dagster's database or that
+# stack's files. See README.md "Why a second Postgres server".
+#
+# It is reachable only from the private `owui-db` network, never from
+# Traefik: nothing here joins `edge` and no host port is bound, so the
+# cluster is unroutable from the internet by construction.
+#
+# To reach it from the VM itself, go through the container rather than
+# opening a port:
+#   docker exec -it owui-postgres psql -U owui_pgadmin postgres
+
+services:
+  postgres:
+    # pgvector/pgvector, not plain postgres: this cluster's entire purpose is
+    # to offer the vector extension to OWUI apps. See README.md.
+    image: pgvector/pgvector:${POSTGRES_TAG}
+    # NOT "postgres" -- that name is already taken by the other, unrelated
+    # cluster's container. Every OWUI app connects to this one at hostname
+    # "owui-postgres", the service name below.
+    container_name: owui-postgres
+    restart: unless-stopped
+
+    # A checkpoint on shutdown can outlast Compose's 10s default, and a
+    # SIGKILL mid-checkpoint means crash recovery on the next start.
+    stop_grace_period: 1m
+
+    environment:
+      - POSTGRES_USER=${POSTGRES_ADMIN_USER}
+      # Left as `postgres` on purpose: the entrypoint skips creating a
+      # database when POSTGRES_DB is the default, so first boot leaves
+      # exactly the cluster initdb makes and nothing named after the admin
+      # role.
+      - POSTGRES_DB=postgres
+      - POSTGRES_INITDB_ARGS=${POSTGRES_INITDB_ARGS}
+      # From secrets.enc.env. The ${VAR:?...} form turns a missing secret
+      # into a clear startup error instead of a database nobody can log in
+      # to.
+      - POSTGRES_PASSWORD=${OWUI_POSTGRES_ADMIN_PASSWORD:?OWUI_POSTGRES_ADMIN_PASSWORD missing from secrets.enc.env}
+
+    volumes:
+      # Mounted at /var/lib/postgresql, NOT /var/lib/postgresql/data: the
+      # postgres:18 image moved PGDATA to /var/lib/postgresql/<major>/docker
+      # and declares the parent as its volume.
+      #
+      # Created by the daemon if absent; the entrypoint makes and chowns
+      # 18/docker underneath it as root, so nothing needs preparing by hand.
+      - ${POSTGRES_DATA_DIR}:/var/lib/postgresql
+
+      # Published so provisioning jobs in OWUI app stacks can connect over
+      # the socket and authenticate with `trust`, instead of every one of
+      # them needing a copy of OWUI_POSTGRES_ADMIN_PASSWORD. Mounting this
+      # directory anywhere is equivalent to handing out superuser -- see
+      # README.md.
+      - ${POSTGRES_SOCKET_DIR}:/var/run/postgresql
+
+    networks:
+      - owui-db
+
+    # Postgres puts parallel-query and hash-join scratch space in /dev/shm;
+    # Docker's 64M default is what makes large queries (and pgvector index
+    # builds) fail with "could not resize shared memory segment".
+    shm_size: 256mb
+
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -q -U $${POSTGRES_USER} -d postgres"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      # initdb on an empty data directory takes appreciably longer than a
+      # restart against an existing cluster.
+      start_period: 60s
+
+networks:
+  # Created by `stacks up` from NETWORKS= in stack.conf. OWUI app stacks join
+  # it as `external: true` as well.
+  owui-db:
+    external: true

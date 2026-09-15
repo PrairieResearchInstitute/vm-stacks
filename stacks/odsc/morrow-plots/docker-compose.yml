@@ -1,0 +1,145 @@
+# Morrow Plots Open WebUI instance: reached through the shared Traefik proxy,
+# backed by a role+database this stack provisions for itself in the
+# DEDICATED owui-postgres cluster (see provision-db.sh) -- not the unrelated
+# `postgres` stack that serves dagster. See
+# stacks/odsc/owui-postgres/README.md for why these are separate clusters.
+# Modeled on stacks/isgs/waterdb/docker-compose.yml's provisioning pattern --
+# see that stack for the fully-annotated original.
+#
+# Two containers, in order -- the job exits, the application stays up:
+#
+#   morrowplots-provision   reconciles this stack's role, database, and the
+#                            pgvector extension in the owui-postgres cluster,
+#                            over its Unix socket
+#           |  service_completed_successfully
+#   owui                     the application
+#
+# Nothing here can depend_on the owui-postgres stack's service: that is a
+# separate Compose project, and depends_on only resolves names within one.
+# The head of the chain waits for the cluster itself -- see provision-db.sh.
+
+services:
+  owui:
+    image: ghcr.io/open-webui/open-webui:${OWUI_TAG}
+    container_name: morrow-plots
+    restart: unless-stopped
+
+    environment:
+      - WEBUI_NAME=Morrow Plots Assistant
+      - ENABLE_SIGNUP=false
+      - VECTOR_DB=pgvector
+      # Host `owui-postgres` -- the OTHER stack's container name, reachable
+      # over the `owui-db` network below. Role, database and password are
+      # all what morrowplots-provision just reconciled.
+      - DATABASE_URL=postgresql://${MORROWPLOTS_DB_USER}:${MORROWPLOTS_DB_PASSWORD:?MORROWPLOTS_DB_PASSWORD missing from secrets.enc.env}@owui-postgres:5432/${MORROWPLOTS_DB_NAME}
+      - PGVECTOR_DB_URL=postgresql://${MORROWPLOTS_DB_USER}:${MORROWPLOTS_DB_PASSWORD:?MORROWPLOTS_DB_PASSWORD missing from secrets.enc.env}@owui-postgres:5432/${MORROWPLOTS_DB_NAME}
+      # From secrets.enc.env. The ${VAR:?...} form documents which secrets
+      # this stack needs and turns a missing one into a clear startup error
+      # instead of an app that comes up with a blank/regenerated key.
+      #
+      # These land in the container environment, so they are readable via
+      # `docker inspect` to anyone in the `docker` group -- root-equivalent
+      # on this host anyway. See docs/secrets.md.
+      - WEBUI_SECRET_KEY=${MORROWPLOTS_WEBUI_SECRET_KEY:?MORROWPLOTS_WEBUI_SECRET_KEY missing from secrets.enc.env}
+
+    volumes:
+      - ${MORROWPLOTS_DATA_DIR}:/app/backend/data
+      # This project's own codebase, read-only, for code-gen Tools. Clone it
+      # to MORROWPLOTS_REPO_DIR by hand first (see .env), then uncomment:
+      # - ${MORROWPLOTS_REPO_DIR}:/app/backend/data/project-code:ro
+
+    networks:
+      - edge
+      - owui-db
+
+    # Not started until its role and database exist and pgvector is enabled.
+    depends_on:
+      morrowplots-provision:
+        condition: service_completed_successfully
+
+    labels:
+      traefik.enable: "true"
+      # Required: this container is on both `edge` and `owui-db`, and
+      # without this label Traefik has two addresses to choose between and
+      # may pick the one it cannot reach. (The traefik stack also sets
+      # --providers.docker.network=edge as its own default, so this is
+      # belt-and-suspenders, not strictly load-bearing -- kept explicit
+      # since it costs nothing and documents the constraint locally too.)
+      traefik.docker.network: edge
+      # Router and service names must be unique across every container on
+      # this VM -- Traefik reads all of their labels at once.
+      traefik.http.routers.morrowplots.rule: Host(`${MORROWPLOTS_HOST}`)
+      traefik.http.routers.morrowplots.entryPoints: websecure
+      traefik.http.routers.morrowplots.tls.certResolver: le
+      # Container-side port: Open WebUI listens on 8080.
+      traefik.http.services.morrowplots.loadbalancer.server.port: "8080"
+
+  # One-shot provisioning job: creates -- or reconciles -- this stack's role,
+  # database, and the pgvector extension in the owui-postgres cluster, then
+  # exits. See provision-db.sh, and stacks/odsc/owui-postgres/README.md
+  # "Provisioning a database for an application" for the pattern this
+  # copies.
+  #
+  # It authenticates over the cluster's Unix socket, where pg_hba.conf says
+  # `local all all trust`, so it needs no admin password and none has to be
+  # copied into this stack's secrets. Mounting that socket directory is
+  # equivalent to being a superuser on the cluster; see the owui-postgres
+  # stack's README.md.
+  #
+  # It leaves an `Exited (0)` container behind on purpose: that is the record
+  # it ran, and `docker logs morrow-plots-provision` says what it did.
+  # `stacks status` therefore reports this stack as 1/2 running rather than
+  # 2/2, which is correct and not a fault.
+  morrowplots-provision:
+    # pgvector/pgvector, not plain postgres: this job also runs `create
+    # extension vector`, and using the same image the owui-postgres stack
+    # runs as a server means the host holds one copy of it rather than two.
+    image: pgvector/pgvector:${POSTGRES_TAG}
+    container_name: morrow-plots-provision
+
+    # Not `unless-stopped`: this is a job. A failure has to stay visible as
+    # Exited (1) rather than thrash, and a success must not be restarted.
+    restart: "no"
+
+    # It talks to the database over a filesystem socket and to nothing else,
+    # so it needs no network at all.
+    network_mode: none
+
+    # Replaces the image's entrypoint outright: this container must not try
+    # to be a server. Invoked via `bash <path>` so the mounted file's mode
+    # does not matter.
+    entrypoint: ["bash", "/provision-db.sh"]
+
+    environment:
+      - POSTGRES_ADMIN_USER=${POSTGRES_ADMIN_USER}
+      - MORROWPLOTS_DB_NAME=${MORROWPLOTS_DB_NAME}
+      - MORROWPLOTS_DB_USER=${MORROWPLOTS_DB_USER}
+      # From secrets.enc.env, same as the application above. Changing it
+      # changes this service's configuration, so `up` recreates the
+      # container and the job re-runs -- which is how a rotated password
+      # reaches the role. `up`, not `restart`; see docs/secrets.md.
+      - MORROWPLOTS_DB_PASSWORD=${MORROWPLOTS_DB_PASSWORD:?MORROWPLOTS_DB_PASSWORD missing from secrets.enc.env}
+
+    volumes:
+      # Relative to this file's directory, which is where `stacks` runs
+      # compose from.
+      - ./provision-db.sh:/provision-db.sh:ro
+      # Where the owui-postgres stack publishes its socket -- NOT the
+      # unrelated `postgres` stack's socket. Read-only: connecting to a
+      # socket does not write to the directory it sits in, and this job has
+      # no business creating anything in the host's /run.
+      #
+      # Must match POSTGRES_SOCKET_DIR in the owui-postgres stack's .env.
+      - ${POSTGRES_SOCKET_DIR}:/var/run/postgresql:ro
+
+    # No `user:`: running as root is what keeps the socket reachable
+    # whatever mode the postgres entrypoint leaves its directory in.
+
+networks:
+  # Created by `stacks up` from NETWORKS= in stack.conf.
+  edge:
+    external: true
+  # The DEDICATED owui-postgres stack's private network -- NOT `db`, which
+  # belongs to the unrelated `postgres` stack.
+  owui-db:
+    external: true
