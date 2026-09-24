@@ -27,6 +27,7 @@ services:
     environment:
       - WEBUI_NAME=Morrow Plots Assistant
       - ENABLE_SIGNUP=false
+      - GLOBAL_LOG_LEVEL=DEBUG
       - VECTOR_DB=pgvector
       # Host `owui-postgres` -- the OTHER stack's container name, reachable
       # over the `owui-db` network below. Role, database and password are
